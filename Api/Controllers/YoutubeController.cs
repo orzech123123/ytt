@@ -398,12 +398,47 @@ namespace Api.Controllers
             }
             catch { }
 
-            // find created file
-            var dir = workDir;
+            // find created file(s)
+            var dir = workDir ?? Environment.CurrentDirectory;
             var prefix = Path.GetFileName(destPrefix) + ".";
-            var files = Directory.GetFiles(dir, prefix + "*").OrderBy(f => new FileInfo(f).Length).ToArray();
-            // choose the first matching file (there should be at least one)
-            return files.Length > 0 ? files[0] : null;
+            var files = Directory.GetFiles(dir, prefix + "*").OrderByDescending(f => new FileInfo(f).Length).ToArray();
+
+            if (files.Length == 0)
+                return null;
+
+            // If there are at least two files, try to merge the two largest into a single mp4 using the exact ffmpeg params requested.
+            if (files.Length >= 2)
+            {
+                var largest = files[0];   // expected to contain the video stream (largest)
+                var second = files[1];    // expected to contain audio or alternate stream
+
+                var mergedName = Path.GetFileNameWithoutExtension(destPrefix) + "_merged.mp4";
+                var mergedPath = Path.Combine(dir, mergedName);
+
+                // Use the exact ffmpeg invocation requested:
+                // ffmpeg -i "<largest>" -i "<second>" -c:v copy -c:a aac -map 0:v:0 -map 1:a:0 output.mp4
+                var ffmpegArgs = $"-i \"{largest}\" -i \"{second}\" -c:v copy -c:a aac -map 0:v:0 -map 1:a:0 -y \"{mergedPath}\"";
+
+                var concatRc = await RunProcessAsync("ffmpeg", ffmpegArgs, dir, cancellationToken);
+
+                try
+                {
+                    var statusFile = Path.Combine(dir, "status.txt");
+                    AppendStatus(statusFile, $"[ffmpeg-merge] ExitCode={concatRc.ExitCode}\nStdOut:\n{concatRc.StdOut}\nStdErr:\n{concatRc.StdErr}");
+                }
+                catch { /* best-effort logging */ }
+
+                if (concatRc.ExitCode == 0 && System.IO.File.Exists(mergedPath))
+                {
+                    return mergedPath;
+                }
+
+                // If merge failed, fall back to returning the largest file (so caller still gets something)
+                return largest;
+            }
+
+            // Single file case - return the only artifact
+            return files[0];
         }
 
         private record ProcessResult(int ExitCode, string StdOut, string StdErr);
