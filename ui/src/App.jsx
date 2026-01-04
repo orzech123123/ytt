@@ -309,7 +309,7 @@ function App() {
         </svg>
 
         <div>
-          <h1 className="ytt-title">YTT — YouTube To Trailer</h1>
+          <h1 className="ytt-title">YTT - YouTube To Trailer</h1>
           <div className="ytt-sub">Quickly compose short trailers from YouTube links</div>
         </div>
       </div>
