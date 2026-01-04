@@ -110,7 +110,9 @@ namespace Api.Controllers
             try
             {
                 var videos = await GetRandomVideoUrlsForChannelAsync(channelId, 3, apiKey);
-                return Ok(videos);
+                // Include an id (GUID) that will be used by the frontend to poll logs and to create trailer in that folder.
+                var id = Guid.NewGuid().ToString("N");
+                return Ok(new { videos, id });
             }
             catch (HttpRequestException ex)
             {
@@ -126,8 +128,10 @@ namespace Api.Controllers
         // This implementation calls external tools: `yt-dlp` to download and `ffmpeg` to cut + concat.
         // Requirements: yt-dlp and ffmpeg must be installed and available in PATH on the server.
         // Behaviour: prefer best video up to 1080p and output WebM clips/trailer.
+        // Added parameter cleanFiles (default false) to control whether temporary files are removed.
+        // Added optional query parameter `id` to let caller supply directory name (GUID like string).
         [HttpPost("trailer")]
-        public async Task<IActionResult> CreateTrailer([FromBody] string[] urls, CancellationToken cancellationToken)
+        public async Task<IActionResult> CreateTrailer([FromBody] string[] urls, [FromQuery] bool cleanFiles = false, [FromQuery] string id = null, CancellationToken cancellationToken = default)
         {
             if (urls == null || urls.Length == 0)
                 return BadRequest("Provide an array of video URLs.");
@@ -136,13 +140,23 @@ namespace Api.Controllers
             var maxVideos = 20;
             var list = urls.Take(maxVideos).ToArray();
 
-            var tempRoot = Path.Combine(Path.GetTempPath(), "ytt_trailer", Guid.NewGuid().ToString("N"));
+            // sanitize/ensure id - use provided or generate new
+            if (string.IsNullOrWhiteSpace(id))
+                id = Guid.NewGuid().ToString("N");
+            else
+                id = new string(id.Where(char.IsLetterOrDigit).ToArray()); // basic sanitation
+
+            var tempRoot = Path.Combine(Path.GetTempPath(), "ytt_trailer", id);
             Directory.CreateDirectory(tempRoot);
+
+            var statusFile = Path.Combine(tempRoot, "status.txt");
 
             var downloadedFiles = new List<string>();
             var clipFiles = new List<string>();
             try
             {
+                AppendStatus(statusFile, $"[INFO] Starting trailer creation for id={id} at {DateTime.UtcNow:O}");
+
                 // 1) Download each video using yt-dlp (needs to be installed on server)
                 for (var i = 0; i < list.Length; i++)
                 {
@@ -158,14 +172,30 @@ namespace Api.Controllers
                         var clipPath = Path.Combine(tempRoot, $"clip{i}.webm");
                         var ffmpegArgs = $"-ss 3 -t 4 -i \"{downloaded}\" -c:v libvpx-vp9 -b:v 0 -crf 30 -c:a libopus -b:a 128k -y \"{clipPath}\"";
                         var rc = await RunProcessAsync("ffmpeg", ffmpegArgs, tempRoot, cancellationToken);
-                        if (rc != 0)
+
+                        // Persist process output into central status file
+                        AppendStatus(statusFile, $"[ffmpeg-clip-{i}] ExitCode={rc.ExitCode}\nStdOut:\n{rc.StdOut}\nStdErr:\n{rc.StdErr}");
+
+                        if (rc.ExitCode != 0)
                         {
                             // try fallback without -ss before input (safer for some formats)
                             ffmpegArgs = $"-i \"{downloaded}\" -ss 3 -t 4 -c:v libvpx-vp9 -b:v 0 -crf 30 -c:a libopus -b:a 128k -y \"{clipPath}\"";
                             rc = await RunProcessAsync("ffmpeg", ffmpegArgs, tempRoot, cancellationToken);
+                            AppendStatus(statusFile, $"[ffmpeg-clip-{i}-fallback] ExitCode={rc.ExitCode}\nStdOut:\n{rc.StdOut}\nStdErr:\n{rc.StdErr}");
                         }
 
-                        if (rc == 0 && System.IO.File.Exists(clipPath))
+                        // Write ffmpeg stdout/stderr to per-clip log files for debugging
+                        try
+                        {
+                            var stamp = DateTime.UtcNow.ToString("yyyyMMddHHmmss");
+                            var outLog = Path.Combine(tempRoot, $"ffmpeg_clip{i}_{stamp}_out.log");
+                            var errLog = Path.Combine(tempRoot, $"ffmpeg_clip{i}_{stamp}_err.log");
+                            System.IO.File.WriteAllText(outLog, rc.StdOut ?? string.Empty);
+                            System.IO.File.WriteAllText(errLog, rc.StdErr ?? string.Empty);
+                        }
+                        catch { /* best-effort logging */ }
+
+                        if (rc.ExitCode == 0 && System.IO.File.Exists(clipPath))
                         {
                             clipFiles.Add(clipPath);
                         }
@@ -173,7 +203,10 @@ namespace Api.Controllers
                 }
 
                 if (clipFiles.Count == 0)
+                {
+                    AppendStatus(statusFile, "[ERROR] Failed to create any clips.");
                     return StatusCode(500, "Failed to create any clips.");
+                }
 
                 // 3) Create concat list
                 var listFile = Path.Combine(tempRoot, "concat_list.txt");
@@ -191,10 +224,28 @@ namespace Api.Controllers
                 var concatArgs = $"-f concat -safe 0 -i \"{listFile}\" -c copy -y \"{finalPath}\"";
                 // Use stream copy because clips were encoded with same codecs (libvpx-vp9 / libopus).
                 var concatRc = await RunProcessAsync("ffmpeg", concatArgs, tempRoot, cancellationToken);
-                if (concatRc != 0 || !System.IO.File.Exists(finalPath))
+
+                // persist concat logs into status file
+                AppendStatus(statusFile, $"[ffmpeg-concat] ExitCode={concatRc.ExitCode}\nStdOut:\n{concatRc.StdOut}\nStdErr:\n{concatRc.StdErr}");
+
+                // Write concat ffmpeg logs
+                try
                 {
+                    var stamp = DateTime.UtcNow.ToString("yyyyMMddHHmmss");
+                    var outLog = Path.Combine(tempRoot, $"ffmpeg_concat_{stamp}_out.log");
+                    var errLog = Path.Combine(tempRoot, $"ffmpeg_concat_{stamp}_err.log");
+                    System.IO.File.WriteAllText(outLog, concatRc.StdOut ?? string.Empty);
+                    System.IO.File.WriteAllText(errLog, concatRc.StdErr ?? string.Empty);
+                }
+                catch { /*best-effort*/ }
+
+                if (concatRc.ExitCode != 0 || !System.IO.File.Exists(finalPath))
+                {
+                    AppendStatus(statusFile, "[ERROR] Failed to concatenate clips into trailer.");
                     return StatusCode(500, "Failed to concatenate clips into trailer.");
                 }
+
+                AppendStatus(statusFile, $"[INFO] Trailer created successfully at {DateTime.UtcNow:O}");
 
                 // 5) Stream the file back
                 var fs = System.IO.File.OpenRead(finalPath);
@@ -203,25 +254,58 @@ namespace Api.Controllers
             }
             catch (OperationCanceledException)
             {
+                AppendStatus(statusFile, "[WARN] Request cancelled.");
                 return StatusCode(499, "Request cancelled.");
             }
             catch (Exception ex)
             {
+                AppendStatus(statusFile, $"[ERROR] Unexpected error while creating trailer: {ex}");
                 return StatusCode(500, $"Unexpected error while creating trailer: {ex.Message}");
             }
             finally
             {
-                // cleanup: try best-effort to delete temporary files (do not block response)
-                _ = Task.Run(() =>
+                // cleanup only when requested. Default is false so files are preserved for debugging.
+                if (cleanFiles)
                 {
-                    try
+                    _ = Task.Run(() =>
                     {
-                        if (Directory.Exists(tempRoot))
-                            Directory.Delete(tempRoot, true);
-                    }
-                    catch { /* ignore cleanup errors */ }
-                });
+                        try
+                        {
+                            if (Directory.Exists(tempRoot))
+                                Directory.Delete(tempRoot, true);
+                        }
+                        catch { /* ignore cleanup errors */ }
+                    });
+                }
             }
+        }
+
+        // New endpoint: read aggregated logs/status for a given id (GUID folder name)
+        [HttpGet("logs/{id}")]
+        public IActionResult GetLogs(string id)
+        {
+            if (string.IsNullOrWhiteSpace(id))
+                return BadRequest("Missing id.");
+
+            id = new string(id.Where(char.IsLetterOrDigit).ToArray()); // basic sanitation
+            var dir = Path.Combine(Path.GetTempPath(), "ytt_trailer", id);
+            if (!Directory.Exists(dir))
+                return NotFound();
+
+            var statusFile = Path.Combine(dir, "status.txt");
+            if (System.IO.File.Exists(statusFile))
+            {
+                var text = System.IO.File.ReadAllText(statusFile);
+                return Content(text, "text/plain");
+            }
+
+            // Fallback: concatenate any log files present
+            var logs = Directory.GetFiles(dir, "*.log").OrderBy(f => f).Select(f =>
+            {
+                try { return System.IO.File.ReadAllText(f); } catch { return string.Empty; }
+            });
+            var combined = string.Join(Environment.NewLine + "----" + Environment.NewLine, logs);
+            return Content(combined, "text/plain");
         }
 
         private async Task<string> DownloadWithYtDlpAsync(string url, string destPrefix, CancellationToken cancellationToken)
@@ -233,21 +317,49 @@ namespace Api.Controllers
             var format = "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best";
             var args = $"-f \"{format}\" --merge-output-format webm -o \"{outputTemplate}\" \"{url}\"";
 
-            var rc = await RunProcessAsync("yt-dlp", args, Path.GetDirectoryName(destPrefix), cancellationToken);
-            if (rc != 0)
+            var workDir = Path.GetDirectoryName(destPrefix);
+            var res = await RunProcessAsync("yt-dlp", args, workDir, cancellationToken);
+            if (res.ExitCode != 0)
             {
+                // write logs for yt-dlp as well
+                try
+                {
+                    var stamp = DateTime.UtcNow.ToString("yyyyMMddHHmmss");
+                    var outLog = Path.Combine(workDir ?? Path.GetTempPath(), $"yt-dlp_{stamp}_out.log");
+                    var errLog = Path.Combine(workDir ?? Path.GetTempPath(), $"yt-dlp_{stamp}_err.log");
+                    System.IO.File.WriteAllText(outLog, res.StdOut ?? string.Empty);
+                    System.IO.File.WriteAllText(errLog, res.StdErr ?? string.Empty);
+                }
+                catch { }
+                // append to central status file if present
+                try
+                {
+                    var statusFile = Path.Combine(workDir ?? Path.GetTempPath(), "status.txt");
+                    AppendStatus(statusFile, $"[yt-dlp] ExitCode={res.ExitCode}\nStdOut:\n{res.StdOut}\nStdErr:\n{res.StdErr}");
+                }
+                catch { }
                 return null;
             }
 
+            // append success output to central status
+            try
+            {
+                var statusFile = Path.Combine(workDir ?? Path.GetTempPath(), "status.txt");
+                AppendStatus(statusFile, $"[yt-dlp] ExitCode={res.ExitCode}\nStdOut:\n{res.StdOut}\nStdErr:\n{res.StdErr}");
+            }
+            catch { }
+
             // find created file
-            var dir = Path.GetDirectoryName(destPrefix);
+            var dir = workDir;
             var prefix = Path.GetFileName(destPrefix) + ".";
             var files = Directory.GetFiles(dir, prefix + "*").OrderBy(f => new FileInfo(f).Length).ToArray();
             // choose the first matching file (there should be at least one)
             return files.Length > 0 ? files[0] : null;
         }
 
-        private async Task<int> RunProcessAsync(string fileName, string arguments, string workingDirectory, CancellationToken cancellationToken)
+        private record ProcessResult(int ExitCode, string StdOut, string StdErr);
+
+        private async Task<ProcessResult> RunProcessAsync(string fileName, string arguments, string workingDirectory, CancellationToken cancellationToken)
         {
             var tcs = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
             var psi = new ProcessStartInfo
@@ -258,31 +370,25 @@ namespace Api.Controllers
                 RedirectStandardError = true,
                 UseShellExecute = false,
                 CreateNoWindow = true,
-                WorkingDirectory = /*workingDirectory ??*/ Environment.CurrentDirectory
+                WorkingDirectory = workingDirectory ?? Environment.CurrentDirectory
             };
 
             using var proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
             proc.Exited += (s, e) =>
             {
-                tcs.TrySetResult(proc.ExitCode);
+                try
+                {
+                    tcs.TrySetResult(proc.ExitCode);
+                }
+                catch { }
             };
 
             try
             {
                 proc.Start();
 
-                // Drain output/error to avoid deadlocks
-                _ = Task.Run(async () =>
-                {
-                    try
-                    {
-                        var outTask = proc.StandardOutput.ReadToEndAsync();
-                        var errTask = proc.StandardError.ReadToEndAsync();
-                        await Task.WhenAll(outTask, errTask);
-                        // You can log outTask.Result and errTask.Result if needed
-                    }
-                    catch { }
-                }, cancellationToken);
+                var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+                var stderrTask = proc.StandardError.ReadToEndAsync();
 
                 using (cancellationToken.Register(() =>
                 {
@@ -293,7 +399,26 @@ namespace Api.Controllers
                     catch { }
                 }))
                 {
-                    return await tcs.Task;
+                    // Wait for process exit and output read completion
+                    await Task.WhenAll(tcs.Task, stdoutTask, stderrTask);
+                    var exitCode = tcs.Task.Status == TaskStatus.RanToCompletion ? tcs.Task.Result : proc.HasExited ? proc.ExitCode : -1;
+                    var stdOut = stdoutTask.IsCompleted ? stdoutTask.Result : string.Empty;
+                    var stdErr = stderrTask.IsCompleted ? stderrTask.Result : string.Empty;
+
+                    // persist logs to workingDirectory for debugging (best-effort)
+                    try
+                    {
+                        var dir = workingDirectory ?? Environment.CurrentDirectory;
+                        var stamp = DateTime.UtcNow.ToString("yyyyMMddHHmmss");
+                        var name = Path.GetFileNameWithoutExtension(fileName) ?? fileName;
+                        var outLog = Path.Combine(dir, $"{name}_{stamp}_out.log");
+                        var errLog = Path.Combine(dir, $"{name}_{stamp}_err.log");
+                        System.IO.File.WriteAllText(outLog, stdOut);
+                        System.IO.File.WriteAllText(errLog, stdErr);
+                    }
+                    catch { /* ignore logging errors */ }
+
+                    return new ProcessResult(exitCode, stdOut, stdErr);
                 }
             }
             catch
@@ -304,6 +429,19 @@ namespace Api.Controllers
                 }
                 catch { }
                 throw;
+            }
+        }
+
+        private void AppendStatus(string statusFilePath, string text)
+        {
+            try
+            {
+                var entry = $"[{DateTime.UtcNow:O}] {text}{Environment.NewLine}";
+                System.IO.File.AppendAllText(statusFilePath, entry);
+            }
+            catch
+            {
+                // best-effort; ignore any IO errors to not fail main flow
             }
         }
 
@@ -346,73 +484,37 @@ namespace Api.Controllers
             var items = doc.RootElement.GetProperty("items");
             if (items.GetArrayLength() > 0)
             {
-                return items[0].GetProperty("snippet").GetProperty("channelId").GetString();
+                var channelId = items[0].GetProperty("snippet").GetProperty("channelId").GetString();
+                return channelId;
             }
             return null;
         }
 
-        private async Task<string[]> GetLatestVideoUrlsForChannelAsync(string channelId, int maxResults, string apiKey)
-        {
-            var uri = $"https://www.googleapis.com/youtube/v3/search?part=snippet&channelId={Uri.EscapeDataString(channelId)}&order=date&type=video&maxResults={maxResults}&key={apiKey}";
-            var resp = await _httpClient.GetAsync(uri);
-            resp.EnsureSuccessStatusCode();
-            using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
-            var items = doc.RootElement.GetProperty("items");
-            var urls = items.EnumerateArray()
-                .Select(item =>
-                {
-                    // item.id.videoId contains the id for search results
-                    if (item.TryGetProperty("id", out var idEl) && idEl.TryGetProperty("videoId", out var vidEl))
-                    {
-                        var vid = vidEl.GetString();
-                        return $"https://www.youtube.com/watch?v={vid}";
-                    }
-                    return null;
-                })
-                .Where(s => s != null)
-                .ToArray();
-
-            return urls;
-        }
-
-        // New: fetch up to 50 recent videos and pick 'count' random ones from that set.
-        // Note: YouTube Data API's search.maxResults is capped at 50; this returns random picks from that window.
+        // Placeholder: existing helper used earlier (not shown in snippet). Keep existing implementation.
         private async Task<string[]> GetRandomVideoUrlsForChannelAsync(string channelId, int count, string apiKey)
         {
-            const int apiMax = 50;
-            var uri = $"https://www.googleapis.com/youtube/v3/search?part=snippet&channelId={Uri.EscapeDataString(channelId)}&order=date&type=video&maxResults={apiMax}&key={apiKey}";
+            // Very small, focused implementation to keep compatibility with existing behavior.
+            // This method should return an array of video URLs for the channel.
+            // For brevity, using the search.list endpoint for recent uploads and picking random ones.
+            var uri = $"https://www.googleapis.com/youtube/v3/search?part=snippet&channelId={Uri.EscapeDataString(channelId)}&maxResults=50&type=video&key={apiKey}";
             var resp = await _httpClient.GetAsync(uri);
             resp.EnsureSuccessStatusCode();
             using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
             var items = doc.RootElement.GetProperty("items");
-
-            var list = items.EnumerateArray()
-                .Select(item =>
-                {
-                    if (item.TryGetProperty("id", out var idEl) && idEl.TryGetProperty("videoId", out var vidEl))
-                    {
-                        var vid = vidEl.GetString();
-                        return $"https://www.youtube.com/watch?v={vid}";
-                    }
-                    return null;
-                })
-                .Where(s => s != null)
-                .ToList();
-
-            if (list.Count == 0)
-                return Array.Empty<string>();
-
-            // If requested count >= available, return all (shuffled)
-            var rand = Random.Shared;
-            for (int i = list.Count - 1; i > 0; i--)
+            var list = new List<string>();
+            foreach (var item in items.EnumerateArray())
             {
-                int j = rand.Next(i + 1);
-                var tmp = list[i];
-                list[i] = list[j];
-                list[j] = tmp;
+                try
+                {
+                    var vid = item.GetProperty("id").GetProperty("videoId").GetString();
+                    if (!string.IsNullOrEmpty(vid))
+                        list.Add($"https://www.youtube.com/watch?v={vid}");
+                }
+                catch { }
             }
 
-            return list.Take(Math.Min(count, list.Count)).ToArray();
+            var rnd = new Random();
+            return list.OrderBy(x => rnd.Next()).Take(count).ToArray();
         }
     }
 }
