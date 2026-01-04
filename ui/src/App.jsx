@@ -89,7 +89,7 @@ function App() {
       const urlObj = window.URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = urlObj;
-      a.download = 'trailer.mp4';
+      a.download = 'trailer.webm';
       document.body.appendChild(a);
       a.click();
       a.remove();

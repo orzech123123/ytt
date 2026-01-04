@@ -106,10 +106,10 @@ namespace Api.Controllers
                 return BadRequest("Could not resolve a channel ID from the provided URL.");
             }
 
-            // Get the 3 most recent videos from the channel
+            // Return 3 random videos from the channel (not the 3 most recent)
             try
             {
-                var videos = await GetLatestVideoUrlsForChannelAsync(channelId, 3, apiKey);
+                var videos = await GetRandomVideoUrlsForChannelAsync(channelId, 3, apiKey);
                 return Ok(videos);
             }
             catch (HttpRequestException ex)
@@ -125,6 +125,7 @@ namespace Api.Controllers
         // NEW: Create trailer from provided list of video URLs.
         // This implementation calls external tools: `yt-dlp` to download and `ffmpeg` to cut + concat.
         // Requirements: yt-dlp and ffmpeg must be installed and available in PATH on the server.
+        // Behaviour: prefer best video up to 1080p and output WebM clips/trailer.
         [HttpPost("trailer")]
         public async Task<IActionResult> CreateTrailer([FromBody] string[] urls, CancellationToken cancellationToken)
         {
@@ -153,14 +154,14 @@ namespace Api.Controllers
                     {
                         downloadedFiles.Add(downloaded);
 
-                        // 2) Cut a short segment: from 3s to 7s (duration 4s). If video is shorter, ffmpeg will produce whatever is available.
-                        var clipPath = Path.Combine(tempRoot, $"clip{i}.mp4");
-                        var ffmpegArgs = $"-ss 3 -t 4 -i \"{downloaded}\" -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k -y \"{clipPath}\"";
+                        // 2) Cut a short segment: from 3s to 7s (duration 4s). Output WebM clips using libvpx-vp9 + libopus.
+                        var clipPath = Path.Combine(tempRoot, $"clip{i}.webm");
+                        var ffmpegArgs = $"-ss 3 -t 4 -i \"{downloaded}\" -c:v libvpx-vp9 -b:v 0 -crf 30 -c:a libopus -b:a 128k -y \"{clipPath}\"";
                         var rc = await RunProcessAsync("ffmpeg", ffmpegArgs, tempRoot, cancellationToken);
                         if (rc != 0)
                         {
                             // try fallback without -ss before input (safer for some formats)
-                            ffmpegArgs = $"-i \"{downloaded}\" -ss 3 -t 4 -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k -y \"{clipPath}\"";
+                            ffmpegArgs = $"-i \"{downloaded}\" -ss 3 -t 4 -c:v libvpx-vp9 -b:v 0 -crf 30 -c:a libopus -b:a 128k -y \"{clipPath}\"";
                             rc = await RunProcessAsync("ffmpeg", ffmpegArgs, tempRoot, cancellationToken);
                         }
 
@@ -185,9 +186,10 @@ namespace Api.Controllers
                     }
                 }
 
-                // 4) Concat into final trailer
-                var finalPath = Path.Combine(tempRoot, "trailer.mp4");
-                var concatArgs = $"-f concat -safe 0 -i \"{listFile}\" -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k -y \"{finalPath}\"";
+                // 4) Concat into final trailer (WebM)
+                var finalPath = Path.Combine(tempRoot, "trailer.webm");
+                var concatArgs = $"-f concat -safe 0 -i \"{listFile}\" -c copy -y \"{finalPath}\"";
+                // Use stream copy because clips were encoded with same codecs (libvpx-vp9 / libopus).
                 var concatRc = await RunProcessAsync("ffmpeg", concatArgs, tempRoot, cancellationToken);
                 if (concatRc != 0 || !System.IO.File.Exists(finalPath))
                 {
@@ -197,7 +199,7 @@ namespace Api.Controllers
                 // 5) Stream the file back
                 var fs = System.IO.File.OpenRead(finalPath);
                 // Return FileStreamResult; letting ASP.NET Core handle range requests may be beneficial for large files
-                return File(fs, "video/mp4", "trailer.mp4");
+                return File(fs, "video/webm", "trailer.webm");
             }
             catch (OperationCanceledException)
             {
@@ -224,10 +226,12 @@ namespace Api.Controllers
 
         private async Task<string> DownloadWithYtDlpAsync(string url, string destPrefix, CancellationToken cancellationToken)
         {
-            // yt-dlp will write file as destPrefix.<ext>, so use pattern to find it after run.
-            // Example args: -f best -o "C:\temp\downloaded0.%(ext)s" "https://..."
+            // Prefer best video up to 1080p and merge to webm when possible.
+            // Format selection: bestvideo with height <= 1080 + bestaudio, fallback to best.
+            // Also instruct yt-dlp to merge output format to webm (requires ffmpeg).
             var outputTemplate = destPrefix + ".%(ext)s";
-            var args = $"-f best -o \"{outputTemplate}\" \"{url}\"";
+            var format = "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best";
+            var args = $"-f \"{format}\" --merge-output-format webm -o \"{outputTemplate}\" \"{url}\"";
 
             var rc = await RunProcessAsync("yt-dlp", args, Path.GetDirectoryName(destPrefix), cancellationToken);
             if (rc != 0)
@@ -369,6 +373,46 @@ namespace Api.Controllers
                 .ToArray();
 
             return urls;
+        }
+
+        // New: fetch up to 50 recent videos and pick 'count' random ones from that set.
+        // Note: YouTube Data API's search.maxResults is capped at 50; this returns random picks from that window.
+        private async Task<string[]> GetRandomVideoUrlsForChannelAsync(string channelId, int count, string apiKey)
+        {
+            const int apiMax = 50;
+            var uri = $"https://www.googleapis.com/youtube/v3/search?part=snippet&channelId={Uri.EscapeDataString(channelId)}&order=date&type=video&maxResults={apiMax}&key={apiKey}";
+            var resp = await _httpClient.GetAsync(uri);
+            resp.EnsureSuccessStatusCode();
+            using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+            var items = doc.RootElement.GetProperty("items");
+
+            var list = items.EnumerateArray()
+                .Select(item =>
+                {
+                    if (item.TryGetProperty("id", out var idEl) && idEl.TryGetProperty("videoId", out var vidEl))
+                    {
+                        var vid = vidEl.GetString();
+                        return $"https://www.youtube.com/watch?v={vid}";
+                    }
+                    return null;
+                })
+                .Where(s => s != null)
+                .ToList();
+
+            if (list.Count == 0)
+                return Array.Empty<string>();
+
+            // If requested count >= available, return all (shuffled)
+            var rand = Random.Shared;
+            for (int i = list.Count - 1; i > 0; i--)
+            {
+                int j = rand.Next(i + 1);
+                var tmp = list[i];
+                list[i] = list[j];
+                list[j] = tmp;
+            }
+
+            return list.Take(Math.Min(count, list.Count)).ToArray();
         }
     }
 }
