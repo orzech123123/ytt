@@ -318,7 +318,56 @@ namespace Api.Controllers
             var args = $"-f \"{format}\" --merge-output-format webm -o \"{outputTemplate}\" \"{url}\"";
 
             var workDir = Path.GetDirectoryName(destPrefix);
-            var res = await RunProcessAsync("yt-dlp", args, workDir, cancellationToken);
+
+            // Try to locate yt-dlp executable and, if present, detect a colocated deno executable.
+            var ytDlpPath = FindExecutablePath("yt-dlp");
+            var denoPath = default(string);
+
+            try
+            {
+                // If yt-dlp was found, check its directory for deno
+                if (!string.IsNullOrEmpty(ytDlpPath))
+                {
+                    var ytDir = Path.GetDirectoryName(ytDlpPath);
+                    if (!string.IsNullOrEmpty(ytDir))
+                    {
+                        var candidateExe = Path.Combine(ytDir, "deno.exe");
+                        var candidateNoExt = Path.Combine(ytDir, "deno");
+                        if (System.IO.File.Exists(candidateExe))
+                            denoPath = candidateExe;
+                        else if (System.IO.File.Exists(candidateNoExt))
+                            denoPath = candidateNoExt;
+                    }
+                }
+
+                // If no colocated deno, fall back to resolving deno from PATH
+                if (string.IsNullOrEmpty(denoPath))
+                {
+                    denoPath = FindExecutablePath("deno");
+                }
+
+                // If deno was found, add the --js-runtimes option so yt-dlp uses that deno executable.
+                // Use explicit yt-dlp full path if available to ensure we're invoking the same binary.
+                if (!string.IsNullOrEmpty(denoPath))
+                {
+                    // Prepend runtime mapping; yt-dlp expects format like: --js-runtimes deno:PATH
+                    // Ensure the path is quoted.
+                    args = $"--js-runtimes deno:\"{denoPath}\" {args}";
+                    try
+                    {
+                        var statusFile = Path.Combine(workDir ?? Path.GetTempPath(), "status.txt");
+                        AppendStatus(statusFile, $"[INFO] Detected deno at '{denoPath}', injecting --js-runtimes.");
+                    }
+                    catch { /* best-effort logging */ }
+                }
+            }
+            catch
+            {
+                // non-fatal - proceed without runtime injection
+            }
+
+            var fileNameToRun = !string.IsNullOrEmpty(ytDlpPath) ? ytDlpPath : "yt-dlp";
+            var res = await RunProcessAsync(fileNameToRun, args, workDir, cancellationToken);
             if (res.ExitCode != 0)
             {
                 // write logs for yt-dlp as well
@@ -515,6 +564,93 @@ namespace Api.Controllers
 
             var rnd = new Random();
             return list.OrderBy(x => rnd.Next()).Take(count).ToArray();
+        }
+
+        private string FindExecutablePath(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                return null;
+
+            // Normalize requested name for checks (allow "deno" or "deno.exe")
+            var requested = name;
+
+            // On Windows, check common per-user deno install location first:
+            // %USERPROFILE%\.deno\bin\deno.exe (this matches the output from the installer you ran)
+            if (Environment.OSVersion.Platform == PlatformID.Win32NT &&
+                (requested.Equals("deno", StringComparison.OrdinalIgnoreCase) || requested.Equals("deno.exe", StringComparison.OrdinalIgnoreCase)))
+            {
+                try
+                {
+                    var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                    if (!string.IsNullOrEmpty(userProfile))
+                    {
+                        var candidate = Path.Combine(userProfile, ".deno", "bin", "deno.exe");
+                        if (System.IO.File.Exists(candidate))
+                            return candidate;
+                    }
+                }
+                catch { /* best-effort */ }
+            }
+
+            // If an absolute path was provided and exists, return it
+            if (Path.IsPathRooted(requested) && System.IO.File.Exists(requested))
+                return requested;
+
+            var pathEnv = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+            var paths = pathEnv.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries);
+
+            var pathext = Environment.OSVersion.Platform == PlatformID.Win32NT
+                ? (Environment.GetEnvironmentVariable("PATHEXT") ?? ".EXE;.CMD;.BAT;.COM").Split(';', StringSplitOptions.RemoveEmptyEntries)
+                : new[] { string.Empty };
+
+            // Search PATH directories with PATHEXT
+            foreach (var dir in paths)
+            {
+                if (string.IsNullOrWhiteSpace(dir))
+                    continue;
+
+                foreach (var ext in pathext)
+                {
+                    var candidate = Path.Combine(dir, requested + ext);
+                    try
+                    {
+                        if (System.IO.File.Exists(candidate))
+                            return candidate;
+                    }
+                    catch { }
+                }
+
+                // Also check the name without extension (useful on Unix)
+                var candNoExt = Path.Combine(dir, requested);
+                try
+                {
+                    if (System.IO.File.Exists(candNoExt))
+                        return candNoExt;
+                }
+                catch { }
+            }
+
+            // Finally check current directory
+            foreach (var ext in pathext)
+            {
+                var cur = Path.Combine(Environment.CurrentDirectory, requested + ext);
+                try
+                {
+                    if (System.IO.File.Exists(cur))
+                        return cur;
+                }
+                catch { }
+            }
+
+            var curNoExt = Path.Combine(Environment.CurrentDirectory, requested);
+            try
+            {
+                if (System.IO.File.Exists(curNoExt))
+                    return curNoExt;
+            }
+            catch { }
+
+            return null;
         }
     }
 }
