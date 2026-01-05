@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -127,7 +128,7 @@ namespace Api.Controllers
         // NEW: Create trailer from provided list of video URLs.
         // This implementation calls external tools: `yt-dlp` to download and `ffmpeg` to cut + concat.
         // Requirements: yt-dlp and ffmpeg must be installed and available in PATH on the server.
-        // Behaviour: prefer best video up to 1080p and output WebM clips/trailer.
+        // Behaviour: prefer best video up to 1080p and output MP4 clips/trailer.
         // Added parameter cleanFiles (default false) to control whether temporary files are removed.
         // Added optional query parameter `id` to let caller supply directory name (GUID like string).
         [HttpPost("trailer")]
@@ -168,9 +169,9 @@ namespace Api.Controllers
                     {
                         downloadedFiles.Add(downloaded);
 
-                        // 2) Cut a short segment: from 3s to 7s (duration 4s). Output WebM clips using libvpx-vp9 + libopus.
-                        var clipPath = Path.Combine(tempRoot, $"clip{i}.webm");
-                        var ffmpegArgs = $"-ss 3 -t 4 -i \"{downloaded}\" -c:v libvpx-vp9 -b:v 0 -crf 30 -c:a libopus -b:a 128k -y \"{clipPath}\"";
+                        // 2) Cut a short segment: from 3s to 7s (duration 4s). Output MP4 clips using libx264 + aac.
+                        var clipPath = Path.Combine(tempRoot, $"clip{i}.mp4");
+                        var ffmpegArgs = $"-ss 3 -t 4 -i \"{downloaded}\" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -pix_fmt yuv420p -y \"{clipPath}\"";
                         var rc = await RunProcessAsync("ffmpeg", ffmpegArgs, tempRoot, cancellationToken);
 
                         // Persist process output into central status file
@@ -179,7 +180,7 @@ namespace Api.Controllers
                         if (rc.ExitCode != 0)
                         {
                             // try fallback without -ss before input (safer for some formats)
-                            ffmpegArgs = $"-i \"{downloaded}\" -ss 3 -t 4 -c:v libvpx-vp9 -b:v 0 -crf 30 -c:a libopus -b:a 128k -y \"{clipPath}\"";
+                            ffmpegArgs = $"-i \"{downloaded}\" -ss 3 -t 4 -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -pix_fmt yuv420p -y \"{clipPath}\"";
                             rc = await RunProcessAsync("ffmpeg", ffmpegArgs, tempRoot, cancellationToken);
                             AppendStatus(statusFile, $"[ffmpeg-clip-{i}-fallback] ExitCode={rc.ExitCode}\nStdOut:\n{rc.StdOut}\nStdErr:\n{rc.StdErr}");
                         }
@@ -208,41 +209,61 @@ namespace Api.Controllers
                     return StatusCode(500, "Failed to create any clips.");
                 }
 
-                // 3) Create concat list
-                var listFile = Path.Combine(tempRoot, "concat_list.txt");
-                using (var sw = new StreamWriter(listFile, false))
-                {
-                    foreach (var clip in clipFiles)
-                    {
-                        // ffmpeg concat demuxer expects paths in single quotes; ensure proper escaping
-                        sw.WriteLine($"file '{clip.Replace("'", "'\\''")}'");
-                    }
-                }
-
-                // 4) Concat into final trailer (WebM)
-                var finalPath = Path.Combine(tempRoot, "trailer.webm");
-                var concatArgs = $"-f concat -safe 0 -i \"{listFile}\" -c copy -y \"{finalPath}\"";
-                // Use stream copy because clips were encoded with same codecs (libvpx-vp9 / libopus).
-                var concatRc = await RunProcessAsync("ffmpeg", concatArgs, tempRoot, cancellationToken);
-
-                // persist concat logs into status file
-                AppendStatus(statusFile, $"[ffmpeg-concat] ExitCode={concatRc.ExitCode}\nStdOut:\n{concatRc.StdOut}\nStdErr:\n{concatRc.StdErr}");
-
-                // Write concat ffmpeg logs
+                // 3) CONCAT: Reliable approach — re-encode all inputs to the same format then concat via filter_complex.
+                // Build ffmpeg command: -i input1 -i input2 ... -filter_complex "[0:v][0:a][1:v][1:a]...concat=n=N:v=1:a=1[outv][outa]" -map "[outv]" -map "[outa]" <encoding options> output.mp4
+                var finalPath = Path.Combine(tempRoot, "trailer.mp4");
                 try
                 {
-                    var stamp = DateTime.UtcNow.ToString("yyyyMMddHHmmss");
-                    var outLog = Path.Combine(tempRoot, $"ffmpeg_concat_{stamp}_out.log");
-                    var errLog = Path.Combine(tempRoot, $"ffmpeg_concat_{stamp}_err.log");
-                    System.IO.File.WriteAllText(outLog, concatRc.StdOut ?? string.Empty);
-                    System.IO.File.WriteAllText(errLog, concatRc.StdErr ?? string.Empty);
-                }
-                catch { /*best-effort*/ }
+                    var inputsSb = new StringBuilder();
+                    for (var i = 0; i < clipFiles.Count; i++)
+                    {
+                        inputsSb.Append($"-i \"{clipFiles[i]}\" ");
+                    }
 
-                if (concatRc.ExitCode != 0 || !System.IO.File.Exists(finalPath))
+                    // Build filter_complex that scales all inputs to 1920x1080 before concatenating
+                    var filterSb = new StringBuilder();
+                    for (var i = 0; i < clipFiles.Count; i++)
+                    {
+                        // Scale video to 1920x1080, pad if needed to maintain aspect ratio
+                        filterSb.Append($"[{i}:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}];");
+                        // Normalize audio
+                        filterSb.Append($"[{i}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a{i}];");
+                    }
+
+                    // Now concat the normalized streams
+                    for (var i = 0; i < clipFiles.Count; i++)
+                    {
+                        filterSb.Append($"[v{i}][a{i}]");
+                    }
+                    filterSb.Append($"concat=n={clipFiles.Count}:v=1:a=1[outv][outa]");
+
+                    var concatArgs = $"{inputsSb.ToString()}-filter_complex \"{filterSb}\" -map \"[outv]\" -map \"[outa]\" -r 30 -pix_fmt yuv420p -c:v libx264 -preset fast -crf 23 -profile:v high -level 4.1 -c:a aac -b:a 192k -ar 48000 -y \"{finalPath}\"";
+
+                    var concatRc = await RunProcessAsync("ffmpeg", concatArgs, tempRoot, cancellationToken);
+
+                    AppendStatus(statusFile, $"[ffmpeg-normalize-concat] ExitCode={concatRc.ExitCode}\nStdOut:\n{concatRc.StdOut}\nStdErr:\n{concatRc.StdErr}");
+
+                    // Write concat ffmpeg logs
+                    try
+                    {
+                        var stamp = DateTime.UtcNow.ToString("yyyyMMddHHmmss");
+                        var outLog = Path.Combine(tempRoot, $"ffmpeg_concat_{stamp}_out.log");
+                        var errLog = Path.Combine(tempRoot, $"ffmpeg_concat_{stamp}_err.log");
+                        System.IO.File.WriteAllText(outLog, concatRc.StdOut ?? string.Empty);
+                        System.IO.File.WriteAllText(errLog, concatRc.StdErr ?? string.Empty);
+                    }
+                    catch { /*best-effort*/ }
+
+                    if (concatRc.ExitCode != 0 || !System.IO.File.Exists(finalPath))
+                    {
+                        AppendStatus(statusFile, "[ERROR] Failed to concatenate clips into trailer (normalize strategy).");
+                        return StatusCode(500, "Failed to concatenate clips into trailer.");
+                    }
+                }
+                catch (Exception ex)
                 {
-                    AppendStatus(statusFile, "[ERROR] Failed to concatenate clips into trailer.");
-                    return StatusCode(500, "Failed to concatenate clips into trailer.");
+                    AppendStatus(statusFile, $"[ERROR] Exception while running normalize concat: {ex}");
+                    return StatusCode(500, $"Failed to concatenate clips into trailer: {ex.Message}");
                 }
 
                 AppendStatus(statusFile, $"[INFO] Trailer created successfully at {DateTime.UtcNow:O}");
@@ -250,7 +271,7 @@ namespace Api.Controllers
                 // 5) Stream the file back
                 var fs = System.IO.File.OpenRead(finalPath);
                 // Return FileStreamResult; letting ASP.NET Core handle range requests may be beneficial for large files
-                return File(fs, "video/webm", "trailer.webm");
+                return File(fs, "video/mp4", "trailer.mp4");
             }
             catch (OperationCanceledException)
             {
@@ -310,12 +331,12 @@ namespace Api.Controllers
 
         private async Task<string> DownloadWithYtDlpAsync(string url, string destPrefix, CancellationToken cancellationToken)
         {
-            // Prefer best video up to 1080p and merge to webm when possible.
+            // Prefer best video up to 1080p and merge to mp4 when possible.
             // Format selection: bestvideo with height <= 1080 + bestaudio, fallback to best.
-            // Also instruct yt-dlp to merge output format to webm (requires ffmpeg).
+            // Also instruct yt-dlp to merge output format to mp4 (requires ffmpeg).
             var outputTemplate = destPrefix + ".%(ext)s";
             var format = "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best";
-            var args = $"-f \"{format}\" --merge-output-format webm -o \"{outputTemplate}\" \"{url}\"";
+            var args = $"-f \"{format}\" --merge-output-format mp4 -o \"{outputTemplate}\" \"{url}\"";
 
             var workDir = Path.GetDirectoryName(destPrefix);
 
@@ -368,28 +389,27 @@ namespace Api.Controllers
 
             var fileNameToRun = !string.IsNullOrEmpty(ytDlpPath) ? ytDlpPath : "yt-dlp";
             var res = await RunProcessAsync(fileNameToRun, args, workDir, cancellationToken);
-            if (res.ExitCode != 0)
-            {
-                // write logs for yt-dlp as well
-                try
-                {
-                    var stamp = DateTime.UtcNow.ToString("yyyyMMddHHmmss");
-                    var outLog = Path.Combine(workDir ?? Path.GetTempPath(), $"yt-dlp_{stamp}_out.log");
-                    var errLog = Path.Combine(workDir ?? Path.GetTempPath(), $"yt-dlp_{stamp}_err.log");
-                    System.IO.File.WriteAllText(outLog, res.StdOut ?? string.Empty);
-                    System.IO.File.WriteAllText(errLog, res.StdErr ?? string.Empty);
-                }
-                catch { }
-                // append to central status file if present
-                try
-                {
-                    var statusFile = Path.Combine(workDir ?? Path.GetTempPath(), "status.txt");
-                    AppendStatus(statusFile, $"[yt-dlp] ExitCode={res.ExitCode}\nStdOut:\n{res.StdOut}\nStdErr:\n{res.StdErr}");
-                }
-                catch { }
-                return null;
-            }
-
+            //if (res.ExitCode != 0)
+            //{
+            //    // write logs for yt-dlp as well
+            //    try
+            //    {
+            //        var stamp = DateTime.UtcNow.ToString("yyyyMMddHHmmss");
+            //        var outLog = Path.Combine(workDir ?? Path.GetTempPath(), $"yt-dlp_{stamp}_out.log");
+            //        var errLog = Path.Combine(workDir ?? Path.GetTempPath(), $"yt-dlp_{stamp}_err.log");
+            //        System.IO.File.WriteAllText(outLog, res.StdOut ?? string.Empty);
+            //        System.IO.File.WriteAllText(errLog, res.StdErr ?? string.Empty);
+            //    }
+            //    catch { }
+            //    // append to central status file if present
+            //    try
+            //    {
+            //        var statusFile = Path.Combine(workDir ?? Path.GetTempPath(), "status.txt");
+            //        AppendStatus(statusFile, $"[yt-dlp] ExitCode={res.ExitCode}\nStdOut:\n{res.StdOut}\nStdErr:\n{res.StdErr}");
+            //    }
+            //    catch { }
+            //    return null;
+            //}
             // append success output to central status
             try
             {
