@@ -111,9 +111,8 @@ namespace Api.Controllers
             try
             {
                 var videos = await GetRandomVideoUrlsForChannelAsync(channelId, 3, apiKey);
-                // Include an id (GUID) that will be used by the frontend to poll logs and to create trailer in that folder.
-                var id = Guid.NewGuid().ToString("N");
-                return Ok(new { videos, id });
+
+                return Ok(new { videos });
             }
             catch (HttpRequestException ex)
             {

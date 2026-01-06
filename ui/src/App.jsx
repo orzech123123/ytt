@@ -77,7 +77,7 @@ function App() {
                 setWorkspaceId(null);
             } else if (data && Array.isArray(data.videos)) {
                 setVideos(data.videos);
-                setWorkspaceId(data.id ?? null);
+                setWorkspaceId(null);
             } else {
                 alert('Error - status: 200 message: unexpected response format');
             }
@@ -94,10 +94,12 @@ function App() {
             return;
         }
 
+        const newId = crypto.randomUUID();
+        setWorkspaceId(newId);
         setCreatingTrailer(true);
         try {
             // If we used manual links, don't send a workspace id - pass URLs directly.
-            const qs = !usedManualLinks && workspaceId ? `?id=${encodeURIComponent(workspaceId)}` : '';
+            const qs = `?id=${encodeURIComponent(newId)}`;
             const response = await fetch(`https://localhost:7127/api/youtube/trailer${qs}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
