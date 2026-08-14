@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -168,9 +168,9 @@ namespace Api.Controllers
                     {
                         downloadedFiles.Add(downloaded);
 
-                        // 2) Cut a short segment: from 3s to 7s (duration 4s). Output MP4 clips using libx264 + aac.
+                        // 2) Cut a short segment: from 3s to 7s (duration 4s). Output high-quality MP4 clips using libx264 (CRF 18) + AAC 192k.
                         var clipPath = Path.Combine(tempRoot, $"clip{i}.mp4");
-                        var ffmpegArgs = $"-ss 3 -t 4 -i \"{downloaded}\" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -pix_fmt yuv420p -y \"{clipPath}\"";
+                        var ffmpegArgs = $"-ss 3 -t 4 -i \"{downloaded}\" -c:v libx264 -preset fast -crf 18 -c:a aac -b:a 192k -pix_fmt yuv420p -y \"{clipPath}\"";
                         var rc = await RunProcessAsync("ffmpeg", ffmpegArgs, tempRoot, cancellationToken);
 
                         // Persist process output into central status file
@@ -179,9 +179,17 @@ namespace Api.Controllers
                         if (rc.ExitCode != 0)
                         {
                             // try fallback without -ss before input (safer for some formats)
-                            ffmpegArgs = $"-i \"{downloaded}\" -ss 3 -t 4 -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -pix_fmt yuv420p -y \"{clipPath}\"";
+                            ffmpegArgs = $"-i \"{downloaded}\" -ss 3 -t 4 -c:v libx264 -preset fast -crf 18 -c:a aac -b:a 192k -pix_fmt yuv420p -y \"{clipPath}\"";
                             rc = await RunProcessAsync("ffmpeg", ffmpegArgs, tempRoot, cancellationToken);
                             AppendStatus(statusFile, $"[ffmpeg-clip-{i}-fallback] ExitCode={rc.ExitCode}\nStdOut:\n{rc.StdOut}\nStdErr:\n{rc.StdErr}");
+                        }
+
+                        if (rc.ExitCode != 0)
+                        {
+                            // fallback with generated silent audio in case the downloaded video is audio-less
+                            ffmpegArgs = $"-ss 3 -t 4 -i \"{downloaded}\" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 -c:v libx264 -preset fast -crf 18 -c:a aac -b:a 192k -map 0:v:0 -map 1:a:0 -shortest -pix_fmt yuv420p -y \"{clipPath}\"";
+                            rc = await RunProcessAsync("ffmpeg", ffmpegArgs, tempRoot, cancellationToken);
+                            AppendStatus(statusFile, $"[ffmpeg-clip-{i}-silent-audio-fallback] ExitCode={rc.ExitCode}\nStdOut:\n{rc.StdOut}\nStdErr:\n{rc.StdErr}");
                         }
 
                         // Write ffmpeg stdout/stderr to per-clip log files for debugging
@@ -208,8 +216,7 @@ namespace Api.Controllers
                     return StatusCode(500, "Failed to create any clips.");
                 }
 
-                // 3) CONCAT: Reliable approach — re-encode all inputs to the same format then concat via filter_complex.
-                // Build ffmpeg command: -i input1 -i input2 ... -filter_complex "[0:v][0:a][1:v][1:a]...concat=n=N:v=1:a=1[outv][outa]" -map "[outv]" -map "[outa]" <encoding options> output.mp4
+                // 3) CONCAT: Reliable approach — re-encode all inputs to high-quality 1080p format then concat via filter_complex.
                 var finalPath = Path.Combine(tempRoot, "trailer.mp4");
                 try
                 {
@@ -219,12 +226,12 @@ namespace Api.Controllers
                         inputsSb.Append($"-i \"{clipFiles[i]}\" ");
                     }
 
-                    // Build filter_complex that scales all inputs to 1920x1080 before concatenating
+                    // Build filter_complex that scales all inputs to 1920x1080 using Lanczos resampling before concatenating
                     var filterSb = new StringBuilder();
                     for (var i = 0; i < clipFiles.Count; i++)
                     {
-                        // Scale video to 1920x1080, pad if needed to maintain aspect ratio
-                        filterSb.Append($"[{i}:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}];");
+                        // Scale video to 1920x1080 with high-quality Lanczos filter, pad if needed to maintain aspect ratio
+                        filterSb.Append($"[{i}:v]scale=1920:1080:flags=lanczos:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}];");
                         // Normalize audio
                         filterSb.Append($"[{i}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a{i}];");
                     }
@@ -236,7 +243,7 @@ namespace Api.Controllers
                     }
                     filterSb.Append($"concat=n={clipFiles.Count}:v=1:a=1[outv][outa]");
 
-                    var concatArgs = $"{inputsSb.ToString()}-filter_complex \"{filterSb}\" -map \"[outv]\" -map \"[outa]\" -r 30 -pix_fmt yuv420p -c:v libx264 -preset fast -crf 23 -profile:v high -level 4.1 -c:a aac -b:a 192k -ar 48000 -y \"{finalPath}\"";
+                    var concatArgs = $"{inputsSb.ToString()}-filter_complex \"{filterSb}\" -map \"[outv]\" -map \"[outa]\" -r 30 -pix_fmt yuv420p -c:v libx264 -preset fast -crf 18 -profile:v high -level 4.1 -c:a aac -b:a 256k -ar 48000 -y \"{finalPath}\"";
 
                     var concatRc = await RunProcessAsync("ffmpeg", concatArgs, tempRoot, cancellationToken);
 
@@ -330,11 +337,9 @@ namespace Api.Controllers
 
         private async Task<string> DownloadWithYtDlpAsync(string url, string destPrefix, CancellationToken cancellationToken)
         {
-            // Prefer best video up to 1080p and merge to mp4 when possible.
-            // Format selection: bestvideo with height <= 1080 + bestaudio, fallback to best.
-            // Also instruct yt-dlp to merge output format to mp4 (requires ffmpeg).
+            // Prioritize high-definition 1080p split streams, falling back to best combined or available formats.
             var outputTemplate = destPrefix + ".%(ext)s";
-            var format = "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best";
+            var format = "bestvideo[height<=1080]+bestaudio/bestvideo+bestaudio/best[height<=1080]/best";
             var args = $"-f \"{format}\" --merge-output-format mp4 -o \"{outputTemplate}\" \"{url}\"";
 
             var workDir = Path.GetDirectoryName(destPrefix);
@@ -388,28 +393,14 @@ namespace Api.Controllers
 
             var fileNameToRun = !string.IsNullOrEmpty(ytDlpPath) ? ytDlpPath : "yt-dlp";
             var res = await RunProcessAsync(fileNameToRun, args, workDir, cancellationToken);
-            //if (res.ExitCode != 0)
-            //{
-            //    // write logs for yt-dlp as well
-            //    try
-            //    {
-            //        var stamp = DateTime.UtcNow.ToString("yyyyMMddHHmmss");
-            //        var outLog = Path.Combine(workDir ?? Path.GetTempPath(), $"yt-dlp_{stamp}_out.log");
-            //        var errLog = Path.Combine(workDir ?? Path.GetTempPath(), $"yt-dlp_{stamp}_err.log");
-            //        System.IO.File.WriteAllText(outLog, res.StdOut ?? string.Empty);
-            //        System.IO.File.WriteAllText(errLog, res.StdErr ?? string.Empty);
-            //    }
-            //    catch { }
-            //    // append to central status file if present
-            //    try
-            //    {
-            //        var statusFile = Path.Combine(workDir ?? Path.GetTempPath(), "status.txt");
-            //        AppendStatus(statusFile, $"[yt-dlp] ExitCode={res.ExitCode}\nStdOut:\n{res.StdOut}\nStdErr:\n{res.StdErr}");
-            //    }
-            //    catch { }
-            //    return null;
-            //}
-            // append success output to central status
+            if (res.ExitCode != 0)
+            {
+                // Try fallback format if primary format failed
+                var jsOpt = !string.IsNullOrEmpty(denoPath) ? $"--js-runtimes deno:\"{denoPath}\" " : "";
+                var fallbackArgs = $"{jsOpt}-f \"best[height<=1080]/b/best\" -o \"{outputTemplate}\" \"{url}\"";
+                res = await RunProcessAsync(fileNameToRun, fallbackArgs, workDir, cancellationToken);
+            }
+
             try
             {
                 var statusFile = Path.Combine(workDir ?? Path.GetTempPath(), "status.txt");
@@ -417,10 +408,18 @@ namespace Api.Controllers
             }
             catch { }
 
-            // find created file(s)
+            if (res.ExitCode != 0)
+            {
+                return null;
+            }
+
+            // find created file(s), ignoring incomplete .part or .ytdl files
             var dir = workDir ?? Environment.CurrentDirectory;
             var prefix = Path.GetFileName(destPrefix) + ".";
-            var files = Directory.GetFiles(dir, prefix + "*").OrderByDescending(f => new FileInfo(f).Length).ToArray();
+            var files = Directory.GetFiles(dir, prefix + "*")
+                .Where(f => !f.EndsWith(".part", StringComparison.OrdinalIgnoreCase) && !f.EndsWith(".ytdl", StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(f => new FileInfo(f).Length)
+                .ToArray();
 
             if (files.Length == 0)
                 return null;
