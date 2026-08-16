@@ -6,9 +6,19 @@ function App() {
     const [videos, setVideos] = useState([]); // array of video URLs returned by API or manually pasted
     const [loading, setLoading] = useState(false);
     const [creatingTrailer, setCreatingTrailer] = useState(false);
+    const [creatingAuto, setCreatingAuto] = useState(false);
+    const [movieCount, setMovieCount] = useState(1);
     const [workspaceId, setWorkspaceId] = useState(null); // GUID returned by submit
     const [logs, setLogs] = useState('');
     const [usedManualLinks, setUsedManualLinks] = useState(false);
+    const getCurrentMonthString = () => {
+        const d = new Date();
+        const year = d.getFullYear();
+        const month = String(d.getMonth() + 1).padStart(2, '0');
+        return `${year}-${month}`;
+    };
+
+    const [minDate, setMinDate] = useState(getCurrentMonthString());
 
     const getVideoId = (videoUrl) => {
         try {
@@ -55,7 +65,7 @@ function App() {
             const response = await fetch('https://localhost:7127/api/youtube/submit', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(url)
+                body: JSON.stringify({ url: url.trim(), minDate: minDate })
             });
 
             if (!response.ok) {
@@ -94,12 +104,12 @@ function App() {
             return;
         }
 
+        const count = Math.max(1, parseInt(movieCount) || 1);
         const newId = crypto.randomUUID();
         setWorkspaceId(newId);
         setCreatingTrailer(true);
         try {
-            // If we used manual links, don't send a workspace id - pass URLs directly.
-            const qs = `?id=${encodeURIComponent(newId)}`;
+            const qs = `?id=${encodeURIComponent(newId)}&count=${count}`;
             const response = await fetch(`https://localhost:7127/api/youtube/trailer${qs}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -116,7 +126,7 @@ function App() {
             const urlObj = window.URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = urlObj;
-            a.download = 'trailer.mp4';
+            a.download = count > 1 ? 'trailers.zip' : 'trailer.mp4';
             document.body.appendChild(a);
             a.click();
             a.remove();
@@ -125,6 +135,52 @@ function App() {
             alert(`Network error while creating trailer: ${err?.message ?? err}`);
         } finally {
             setCreatingTrailer(false);
+        }
+    };
+
+    const handleAutoGenerate = async () => {
+        const manual = parseLinksText(linksText);
+        if (manual.length === 0 && !url.trim()) {
+            alert('Please enter a YouTube channel URL or paste video links first.');
+            return;
+        }
+
+        const newId = crypto.randomUUID();
+        setWorkspaceId(newId);
+        setCreatingAuto(true);
+        try {
+            const payload = {
+                url: url.trim(),
+                manualUrls: manual,
+                rounds: 5,
+                countPerRound: 3,
+                minDate: minDate
+            };
+            const response = await fetch(`https://localhost:7127/api/youtube/auto?id=${encodeURIComponent(newId)}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            if (!response.ok) {
+                let text = await response.text();
+                alert(`AUTO mode failed: ${response.status} ${text}`);
+                return;
+            }
+
+            const blob = await response.blob();
+            const urlObj = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = urlObj;
+            a.download = 'auto_trailers_15.zip';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            window.URL.revokeObjectURL(urlObj);
+        } catch (err) {
+            alert(`Network error during AUTO mode: ${err?.message ?? err}`);
+        } finally {
+            setCreatingAuto(false);
         }
     };
 
@@ -260,7 +316,19 @@ function App() {
           border: none;
           color: white;
         }
-        .ytt-btn.primary[disabled], .ytt-btn[disabled] {
+        .ytt-btn.auto {
+          background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+          border: none;
+          color: white;
+          font-weight: 700;
+          white-space: nowrap;
+          box-shadow: 0 4px 12px rgba(245, 158, 11, 0.35);
+        }
+        .ytt-btn.auto:hover {
+          background: linear-gradient(135deg, #fbbf24 0%, #f59e0b 100%);
+          box-shadow: 0 6px 16px rgba(245, 158, 11, 0.55);
+        }
+        .ytt-btn.primary[disabled], .ytt-btn.auto[disabled], .ytt-btn[disabled] {
           opacity: 0.45;
           cursor: not-allowed;
           transform: none;
@@ -349,7 +417,7 @@ function App() {
             </div>
 
             <div className="ytt-panel">
-                {/* Top controls: only the URL field remains here */}
+                {/* Top controls with URL field and AUTO button */}
                 <div className="ytt-controls">
                     <input
                         className="ytt-input"
@@ -358,6 +426,24 @@ function App() {
                         onChange={(e) => setUrl(e.target.value)}
                         placeholder="Enter YouTube channel or playlist URL (used only if no manual links provided)"
                     />
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap' }}>
+                        <label style={{ color: 'var(--muted)', fontSize: 13 }}>Not older than:</label>
+                        <input
+                            className="ytt-input"
+                            type="month"
+                            style={{ width: 145, textAlign: 'center', colorScheme: 'dark' }}
+                            value={minDate}
+                            onChange={(e) => setMinDate(e.target.value)}
+                        />
+                    </div>
+                    <button
+                        className="ytt-btn auto"
+                        onClick={handleAutoGenerate}
+                        disabled={loading || creatingTrailer || creatingAuto}
+                        title="5 rounds x 3 movies = 15 movies total"
+                    >
+                        {creatingAuto ? '⚡ Creating AUTO (15 movies)...' : '⚡ AUTO (15 Movies)'}
+                    </button>
                 </div>
 
                 {/* Links textarea + Submit button (Submit moved under the fields) */}
@@ -427,15 +513,30 @@ function App() {
                     )}
                 </div>
 
-                {/* Create trailer moved under the rendered videos.
-                    New condition: disabled if no videos displayed */}
-                <div style={{ marginTop: 12 }}>
+                {/* Number of movies to generate control and Create trailer button */}
+                <div style={{ marginTop: 16, display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 12 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <label style={{ color: 'var(--muted)', fontSize: 14 }}>
+                            Number of movies to generate:
+                        </label>
+                        <input
+                            className="ytt-input"
+                            type="number"
+                            min="1"
+                            max="50"
+                            style={{ width: 80, textAlign: 'center' }}
+                            value={movieCount}
+                            onChange={(e) => setMovieCount(Math.max(1, parseInt(e.target.value) || 1))}
+                        />
+                    </div>
                     <button
                         className="ytt-btn primary"
                         onClick={handleCreateTrailer}
                         disabled={creatingTrailer || !miniaturesVisible}
                     >
-                        {creatingTrailer ? 'Creating trailer...' : 'Create trailer'}
+                        {creatingTrailer
+                            ? `Creating ${movieCount > 1 ? `${movieCount} movies` : 'trailer'}...`
+                            : `Create ${movieCount > 1 ? `${movieCount} movies` : 'trailer'}`}
                     </button>
                 </div>
 

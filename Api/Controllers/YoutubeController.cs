@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Net.Http;
 using System.Text;
@@ -34,8 +36,26 @@ namespace Api.Controllers
         private const string VideoMaxrate = "6000k";
         private const string VideoBufsize = "12000k";
 
-        // 15 seconds total trailer: 5 clips x 3 seconds each
-        private const int ClipDurationSeconds = 3;
+        // 15 seconds total trailer: 3 clips x 5 seconds each from random timeline positions
+        private const int ClipDurationSeconds = 5;
+        private const int ClipsPerMovie = 3;
+
+        private class SourceVideoInfo
+        {
+            public string Url { get; set; } = string.Empty;
+            public string FilePath { get; set; } = string.Empty;
+            public double DurationSeconds { get; set; }
+        }
+
+        public class AutoRequest
+        {
+            public string Url { get; set; } = string.Empty;
+            public string[] ManualUrls { get; set; } = Array.Empty<string>();
+            public int Rounds { get; set; } = 5;
+            public int CountPerRound { get; set; } = 3;
+            public int? MinYear { get; set; }
+            public string MinDate { get; set; }
+        }
 
         public YoutubeController(IConfiguration configuration)
         {
@@ -43,8 +63,30 @@ namespace Api.Controllers
         }
 
         [HttpPost("submit")]
-        public async Task<IActionResult> PostUrl([FromBody] string url)
+        public async Task<IActionResult> PostUrl([FromBody] JsonElement body)
         {
+            string url = string.Empty;
+            string minDate = null;
+
+            if (body.ValueKind == JsonValueKind.String)
+            {
+                url = body.GetString() ?? string.Empty;
+            }
+            else if (body.ValueKind == JsonValueKind.Object)
+            {
+                if (body.TryGetProperty("url", out var urlProp))
+                    url = urlProp.GetString() ?? string.Empty;
+
+                if (body.TryGetProperty("minDate", out var minDateProp))
+                {
+                    minDate = minDateProp.GetString();
+                }
+                else if (body.TryGetProperty("minYear", out var minYearProp))
+                {
+                    minDate = minYearProp.ToString();
+                }
+            }
+
             if (string.IsNullOrWhiteSpace(url))
             {
                 return BadRequest("You must supply a YouTube channel or video URL in the request body.");
@@ -56,64 +98,7 @@ namespace Api.Controllers
                 return BadRequest("Missing YouTube API key. Set configuration key 'YouTubeApiKey' or environment variable 'YOUTUBE_API_KEY'.");
             }
 
-            if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
-            {
-                if (Uri.TryCreate("https://" + url, UriKind.Absolute, out uri) == false)
-                {
-                    return BadRequest("Invalid URL format.");
-                }
-            }
-
-            string channelId = null;
-
-            var segments = uri.AbsolutePath.Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries);
-            if (segments.Length >= 2 && segments[0].Equals("channel", StringComparison.OrdinalIgnoreCase))
-            {
-                channelId = segments[1];
-            }
-
-            if (string.IsNullOrEmpty(channelId) && segments.Length >= 2 && segments[0].Equals("user", StringComparison.OrdinalIgnoreCase))
-            {
-                var username = segments[1];
-                channelId = await ResolveChannelIdByUsernameAsync(username, apiKey);
-            }
-
-            if (string.IsNullOrEmpty(channelId) && segments.Length >= 1)
-            {
-                var first = segments[0];
-                if (first.StartsWith("@"))
-                {
-                    var handle = first.TrimStart('@');
-                    channelId = await ResolveChannelIdByQueryAsync(handle, apiKey);
-                }
-                else if (first.Equals("c", StringComparison.OrdinalIgnoreCase) && segments.Length >= 2)
-                {
-                    var custom = segments[1];
-                    channelId = await ResolveChannelIdByQueryAsync(custom, apiKey);
-                }
-            }
-
-            if (string.IsNullOrEmpty(channelId))
-            {
-                string videoId = null;
-                if (uri.Host.Contains("youtube.com", StringComparison.OrdinalIgnoreCase) && uri.AbsolutePath.StartsWith("/watch", StringComparison.OrdinalIgnoreCase))
-                {
-                    var q = System.Web.HttpUtility.ParseQueryString(uri.Query);
-                    videoId = q["v"];
-                }
-                else if (uri.Host.Equals("youtu.be", StringComparison.OrdinalIgnoreCase))
-                {
-                    var segs = uri.AbsolutePath.Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries);
-                    if (segs.Length >= 1)
-                        videoId = segs[0];
-                }
-
-                if (!string.IsNullOrEmpty(videoId))
-                {
-                    channelId = await ResolveChannelIdByVideoIdAsync(videoId, apiKey);
-                }
-            }
-
+            var channelId = await ResolveChannelIdFromUrlAsync(url, apiKey);
             if (string.IsNullOrEmpty(channelId))
             {
                 return BadRequest("Could not resolve a channel ID from the provided URL.");
@@ -121,8 +106,7 @@ namespace Api.Controllers
 
             try
             {
-                // Returns 5 random videos to make a 15s trailer (5 clips x 3s)
-                var videos = await GetRandomVideoUrlsForChannelAsync(channelId, 5, apiKey);
+                var videos = await GetRandomVideoUrlsForChannelAsync(channelId, 10, apiKey, minDate);
                 return Ok(new { videos });
             }
             catch (HttpRequestException ex)
@@ -136,14 +120,17 @@ namespace Api.Controllers
         }
 
         [HttpPost("trailer")]
-        public async Task<IActionResult> CreateTrailer([FromBody] string[] urls, [FromQuery] bool cleanFiles = false, [FromQuery] string id = null, CancellationToken cancellationToken = default)
+        public async Task<IActionResult> CreateTrailer(
+            [FromBody] string[] urls, 
+            [FromQuery] int count = 1, 
+            [FromQuery] bool cleanFiles = false, 
+            [FromQuery] string id = null, 
+            CancellationToken cancellationToken = default)
         {
             if (urls == null || urls.Length == 0)
                 return BadRequest("Provide an array of video URLs.");
 
-            // Take up to 5 videos for a 15-second trailer (5 clips x 3s each)
-            var maxVideos = 5;
-            var list = urls.Take(maxVideos).ToArray();
+            count = Math.Max(1, Math.Min(count, 50));
 
             if (string.IsNullOrWhiteSpace(id))
                 id = Guid.NewGuid().ToString("N");
@@ -154,62 +141,133 @@ namespace Api.Controllers
             Directory.CreateDirectory(tempRoot);
 
             var statusFile = Path.Combine(tempRoot, "status.txt");
-            var clipFiles = new List<string>();
 
             try
             {
-                AppendStatus(statusFile, $"[INFO] Starting 15s mobile trailer creation for id={id} ({list.Length} videos requested) at {DateTime.UtcNow:O}");
+                AppendStatus(statusFile, $"[INFO] Starting trailer creation for id={id}: requesting {count} movie(s) ({ClipsPerMovie} clips x {ClipDurationSeconds}s random chunks = {ClipsPerMovie * ClipDurationSeconds}s total per movie) at {DateTime.UtcNow:O}");
 
-                // 1) Fast download and cut 3s clip from each video
-                for (var i = 0; i < list.Length; i++)
+                // 1) Download unique source videos
+                var uniqueUrls = urls.Where(u => !string.IsNullOrWhiteSpace(u)).Distinct().ToArray();
+                var downloadedSources = new List<SourceVideoInfo>();
+
+                for (var i = 0; i < uniqueUrls.Length; i++)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    var url = list[i];
-                    var prefix = Path.Combine(tempRoot, $"downloaded{i}");
+                    var url = uniqueUrls[i];
+                    var prefix = Path.Combine(tempRoot, $"source_{i}");
 
+                    AppendStatus(statusFile, $"[INFO] Downloading source video {i + 1}/{uniqueUrls.Length}: {url}");
                     var downloaded = await DownloadWithYtDlpAsync(url, prefix, cancellationToken);
                     if (downloaded == null || !System.IO.File.Exists(downloaded))
                     {
-                        AppendStatus(statusFile, $"[WARN] Skipping video {i} ({url}) - download failed.");
+                        AppendStatus(statusFile, $"[WARN] Skipping video {i + 1} ({url}) - download failed.");
                         continue;
                     }
 
-                    var clipPath = Path.Combine(tempRoot, $"clip{i}.mp4");
-                    var clipOk = await EncodeSingleClipAsync(downloaded, clipPath, tempRoot, statusFile, i, cancellationToken);
+                    var duration = await GetVideoDurationAsync(downloaded, tempRoot, cancellationToken);
+                    AppendStatus(statusFile, $"[INFO] Downloaded source video {i + 1}: duration={duration:F1}s ({Path.GetFileName(downloaded)})");
 
-                    if (clipOk && System.IO.File.Exists(clipPath))
+                    downloadedSources.Add(new SourceVideoInfo
                     {
-                        clipFiles.Add(clipPath);
+                        Url = url,
+                        FilePath = downloaded,
+                        DurationSeconds = duration
+                    });
+                }
+
+                if (downloadedSources.Count == 0)
+                {
+                    AppendStatus(statusFile, "[ERROR] Failed to download any valid source videos.");
+                    return StatusCode(500, "Failed to download any valid source videos.");
+                }
+
+                AppendStatus(statusFile, $"[INFO] Prepared {downloadedSources.Count} source video(s). Generating {count} movie(s)...");
+
+                var generatedMovies = new List<string>();
+                var rnd = new Random();
+
+                // 2) Generate N movies
+                for (var m = 0; m < count; m++)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    AppendStatus(statusFile, $"[INFO] --- Generating Movie {m + 1}/{count} ---");
+
+                    var movieClipFiles = new List<string>();
+
+                    for (var c = 0; c < ClipsPerMovie; c++)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+
+                        var source = downloadedSources[rnd.Next(downloadedSources.Count)];
+                        var maxStart = Math.Max(0.0, source.DurationSeconds - ClipDurationSeconds);
+                        var startSec = rnd.NextDouble() * maxStart;
+
+                        var clipPath = Path.Combine(tempRoot, $"movie_{m}_clip_{c}.mp4");
+                        AppendStatus(statusFile, $"[INFO] Movie {m + 1} Clip {c + 1}: cutting {ClipDurationSeconds}s chunk starting at {startSec:F1}s from timeline (0-{source.DurationSeconds:F1}s)");
+
+                        var clipOk = await EncodeSingleClipAsync(source.FilePath, startSec, ClipDurationSeconds, clipPath, tempRoot, statusFile, $"m{m + 1}-c{c + 1}", cancellationToken);
+
+                        if (clipOk && System.IO.File.Exists(clipPath))
+                        {
+                            movieClipFiles.Add(clipPath);
+                        }
+                        else
+                        {
+                            AppendStatus(statusFile, $"[WARN] Skipping clip {c + 1} for Movie {m + 1} - encoding failed.");
+                        }
+                    }
+
+                    if (movieClipFiles.Count == 0)
+                    {
+                        AppendStatus(statusFile, $"[WARN] Movie {m + 1} could not compile any valid clips.");
+                        continue;
+                    }
+
+                    var moviePath = Path.Combine(tempRoot, count == 1 ? "trailer.mp4" : $"trailer_{m + 1}.mp4");
+                    var concatOk = await ConcatClipsAsync(movieClipFiles, moviePath, tempRoot, statusFile, cancellationToken);
+
+                    if (concatOk && System.IO.File.Exists(moviePath))
+                    {
+                        generatedMovies.Add(moviePath);
+                        AppendStatus(statusFile, $"[INFO] Movie {m + 1}/{count} created successfully: {Path.GetFileName(moviePath)} ({movieClipFiles.Count * ClipDurationSeconds}s)");
                     }
                     else
                     {
-                        AppendStatus(statusFile, $"[WARN] Skipping clip {i} - encoding failed.");
+                        AppendStatus(statusFile, $"[ERROR] Movie {m + 1}/{count} concatenation failed.");
                     }
                 }
 
-                if (clipFiles.Count == 0)
+                if (generatedMovies.Count == 0)
                 {
-                    AppendStatus(statusFile, "[ERROR] Failed to create any valid clips.");
-                    return StatusCode(500, "Failed to create any valid clips.");
+                    AppendStatus(statusFile, "[ERROR] Failed to generate any completed movies.");
+                    return StatusCode(500, "Failed to generate any completed movies.");
                 }
 
-                AppendStatus(statusFile, $"[INFO] Prepared {clipFiles.Count} / {list.Length} clips ({clipFiles.Count * ClipDurationSeconds}s total duration).");
-
-                var finalPath = Path.Combine(tempRoot, "trailer.mp4");
-
-                // 2) Fast filter_complex concatenation
-                var concatOk = await ConcatClipsAsync(clipFiles, finalPath, tempRoot, statusFile, cancellationToken);
-
-                if (!concatOk || !System.IO.File.Exists(finalPath))
+                // 3) Package & return
+                if (count > 1 && generatedMovies.Count > 1)
                 {
-                    AppendStatus(statusFile, "[ERROR] Failed to concatenate clips into final trailer.");
-                    return StatusCode(500, "Failed to concatenate clips into trailer.");
+                    var zipPath = Path.Combine(tempRoot, "trailers.zip");
+                    if (System.IO.File.Exists(zipPath))
+                        System.IO.File.Delete(zipPath);
+
+                    using (var archive = ZipFile.Open(zipPath, ZipArchiveMode.Create))
+                    {
+                        for (var idx = 0; idx < generatedMovies.Count; idx++)
+                        {
+                            archive.CreateEntryFromFile(generatedMovies[idx], GetRandomPackageFileName());
+                        }
+                    }
+
+                    AppendStatus(statusFile, $"[INFO] Successfully packaged {generatedMovies.Count} movies into trailers.zip at {DateTime.UtcNow:O}");
+                    var fs = System.IO.File.OpenRead(zipPath);
+                    return File(fs, "application/zip", "trailers.zip");
                 }
-
-                AppendStatus(statusFile, $"[INFO] 15s Trailer created successfully ({clipFiles.Count} clips included) at {DateTime.UtcNow:O}");
-
-                var fs = System.IO.File.OpenRead(finalPath);
-                return File(fs, "video/mp4", "trailer.mp4", enableRangeProcessing: true);
+                else
+                {
+                    AppendStatus(statusFile, $"[INFO] Outputting single movie at {DateTime.UtcNow:O}");
+                    var fs = System.IO.File.OpenRead(generatedMovies[0]);
+                    return File(fs, "video/mp4", Path.GetFileName(generatedMovies[0]), enableRangeProcessing: true);
+                }
             }
             catch (OperationCanceledException)
             {
@@ -220,6 +278,203 @@ namespace Api.Controllers
             {
                 AppendStatus(statusFile, $"[ERROR] Unexpected error while creating trailer: {ex}");
                 return StatusCode(500, $"Unexpected error while creating trailer: {ex.Message}");
+            }
+            finally
+            {
+                if (cleanFiles)
+                {
+                    _ = Task.Run(() =>
+                    {
+                        try
+                        {
+                            if (Directory.Exists(tempRoot))
+                                Directory.Delete(tempRoot, true);
+                        }
+                        catch { }
+                    });
+                }
+            }
+        }
+
+        [HttpPost("auto")]
+        public async Task<IActionResult> AutoTrailer(
+            [FromBody] AutoRequest req, 
+            [FromQuery] bool cleanFiles = false, 
+            [FromQuery] string id = null, 
+            CancellationToken cancellationToken = default)
+        {
+            req ??= new AutoRequest();
+            var rounds = Math.Max(1, Math.Min(req.Rounds <= 0 ? 5 : req.Rounds, 10));
+            var countPerRound = Math.Max(1, Math.Min(req.CountPerRound <= 0 ? 3 : req.CountPerRound, 10));
+            var totalExpected = rounds * countPerRound;
+
+            if (string.IsNullOrWhiteSpace(id))
+                id = Guid.NewGuid().ToString("N");
+            else
+                id = new string(id.Where(char.IsLetterOrDigit).ToArray());
+
+            var tempRoot = Path.Combine(Path.GetTempPath(), "ytt_trailer", id);
+            Directory.CreateDirectory(tempRoot);
+
+            var statusFile = Path.Combine(tempRoot, "status.txt");
+
+            try
+            {
+                AppendStatus(statusFile, $"[INFO] Starting AUTO trailer creation for id={id}: {rounds} rounds x {countPerRound} movies = {totalExpected} total movies at {DateTime.UtcNow:O}");
+
+                var apiKey = _configuration["YouTubeApiKey"] ?? Environment.GetEnvironmentVariable("YOUTUBE_API_KEY");
+                var hasManual = req.ManualUrls != null && req.ManualUrls.Length > 0;
+
+                string channelId = null;
+                if (!hasManual)
+                {
+                    if (string.IsNullOrWhiteSpace(req.Url))
+                    {
+                        return BadRequest("Provide a YouTube channel URL or manual video links for AUTO mode.");
+                    }
+
+                    if (string.IsNullOrWhiteSpace(apiKey))
+                    {
+                        return BadRequest("Missing YouTube API key. Set configuration key 'YouTubeApiKey' or environment variable 'YOUTUBE_API_KEY'.");
+                    }
+
+                    channelId = await ResolveChannelIdFromUrlAsync(req.Url, apiKey);
+                    if (string.IsNullOrEmpty(channelId))
+                    {
+                        return BadRequest("Could not resolve a channel ID from the provided URL.");
+                    }
+                }
+
+                var allGeneratedMovies = new List<string>();
+                var rnd = new Random();
+
+                for (var r = 0; r < rounds; r++)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    AppendStatus(statusFile, $"[INFO] ==========================================");
+                    AppendStatus(statusFile, $"[INFO] === AUTO ROUND {r + 1} / {rounds}: Fetching random videos & generating {countPerRound} movies ===");
+                    AppendStatus(statusFile, $"[INFO] ==========================================");
+
+                    string[] videoUrls = Array.Empty<string>();
+
+                    if (hasManual)
+                    {
+                        videoUrls = req.ManualUrls.OrderBy(_ => rnd.Next()).Take(5).ToArray();
+                    }
+                    else
+                    {
+                        try
+                        {
+                            videoUrls = await GetRandomVideoUrlsForChannelAsync(channelId, 5, apiKey, req.MinDate ?? req.MinYear?.ToString());
+                        }
+                        catch (Exception ex)
+                        {
+                            AppendStatus(statusFile, $"[WARN] Round {r + 1}: Error fetching channel videos: {ex.Message}");
+                        }
+                    }
+
+                    if (videoUrls == null || videoUrls.Length == 0)
+                    {
+                        AppendStatus(statusFile, $"[WARN] Round {r + 1}: No video URLs available.");
+                        continue;
+                    }
+
+                    var uniqueUrls = videoUrls.Where(u => !string.IsNullOrWhiteSpace(u)).Distinct().ToArray();
+                    var downloadedSources = new List<SourceVideoInfo>();
+
+                    for (var i = 0; i < uniqueUrls.Length; i++)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        var url = uniqueUrls[i];
+                        var prefix = Path.Combine(tempRoot, $"r{r + 1}_source_{i}");
+
+                        var downloaded = await DownloadWithYtDlpAsync(url, prefix, cancellationToken);
+                        if (downloaded == null || !System.IO.File.Exists(downloaded))
+                            continue;
+
+                        var duration = await GetVideoDurationAsync(downloaded, tempRoot, cancellationToken);
+                        downloadedSources.Add(new SourceVideoInfo
+                        {
+                            Url = url,
+                            FilePath = downloaded,
+                            DurationSeconds = duration
+                        });
+                    }
+
+                    if (downloadedSources.Count == 0)
+                    {
+                        AppendStatus(statusFile, $"[WARN] Round {r + 1}: Failed to download any source videos.");
+                        continue;
+                    }
+
+                    for (var m = 0; m < countPerRound; m++)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+
+                        var movieClipFiles = new List<string>();
+
+                        for (var c = 0; c < ClipsPerMovie; c++)
+                        {
+                            cancellationToken.ThrowIfCancellationRequested();
+
+                            var source = downloadedSources[rnd.Next(downloadedSources.Count)];
+                            var maxStart = Math.Max(0.0, source.DurationSeconds - ClipDurationSeconds);
+                            var startSec = rnd.NextDouble() * maxStart;
+
+                            var clipPath = Path.Combine(tempRoot, $"r{r + 1}_m{m + 1}_clip_{c}.mp4");
+                            var clipOk = await EncodeSingleClipAsync(source.FilePath, startSec, ClipDurationSeconds, clipPath, tempRoot, statusFile, $"r{r + 1}-m{m + 1}-c{c + 1}", cancellationToken);
+
+                            if (clipOk && System.IO.File.Exists(clipPath))
+                            {
+                                movieClipFiles.Add(clipPath);
+                            }
+                        }
+
+                        if (movieClipFiles.Count == 0)
+                            continue;
+
+                        var moviePath = Path.Combine(tempRoot, $"auto_r{r + 1}_m{m + 1}.mp4");
+                        var concatOk = await ConcatClipsAsync(movieClipFiles, moviePath, tempRoot, statusFile, cancellationToken);
+
+                        if (concatOk && System.IO.File.Exists(moviePath))
+                        {
+                            allGeneratedMovies.Add(moviePath);
+                            AppendStatus(statusFile, $"[INFO] Round {r + 1} Movie {m + 1}/{countPerRound} created! (Total completed: {allGeneratedMovies.Count}/{totalExpected})");
+                        }
+                    }
+                }
+
+                if (allGeneratedMovies.Count == 0)
+                {
+                    AppendStatus(statusFile, "[ERROR] AUTO mode failed to generate any completed movies.");
+                    return StatusCode(500, "AUTO mode failed to generate any completed movies.");
+                }
+
+                var zipPath = Path.Combine(tempRoot, "auto_trailers_15.zip");
+                if (System.IO.File.Exists(zipPath))
+                    System.IO.File.Delete(zipPath);
+
+                using (var archive = ZipFile.Open(zipPath, ZipArchiveMode.Create))
+                {
+                    for (var idx = 0; idx < allGeneratedMovies.Count; idx++)
+                    {
+                        archive.CreateEntryFromFile(allGeneratedMovies[idx], GetRandomPackageFileName());
+                    }
+                }
+
+                AppendStatus(statusFile, $"[INFO] AUTO generation complete! Packaged {allGeneratedMovies.Count} movies into auto_trailers_15.zip at {DateTime.UtcNow:O}");
+                var fs = System.IO.File.OpenRead(zipPath);
+                return File(fs, "application/zip", "auto_trailers_15.zip");
+            }
+            catch (OperationCanceledException)
+            {
+                AppendStatus(statusFile, "[WARN] Request cancelled.");
+                return StatusCode(499, "Request cancelled.");
+            }
+            catch (Exception ex)
+            {
+                AppendStatus(statusFile, $"[ERROR] Unexpected error in AUTO generation: {ex}");
+                return StatusCode(500, $"Unexpected error in AUTO generation: {ex.Message}");
             }
             finally
             {
@@ -265,11 +520,21 @@ namespace Api.Controllers
         }
 
         // ---------------------------------------------------------------
-        // High-Quality Clip Encoding (3s per clip, H.264 Main L4.1 1080p CFR 30fps)
+        // High-Quality Clip Encoding (5s per clip, H.264 Main L4.1 1080p CFR 30fps)
         // ---------------------------------------------------------------
 
-        private async Task<bool> EncodeSingleClipAsync(string sourcePath, string clipPath, string workDir, string statusFile, int clipIndex, CancellationToken cancellationToken)
+        private async Task<bool> EncodeSingleClipAsync(
+            string sourcePath,
+            double startSeconds,
+            int clipDurationSeconds,
+            string clipPath,
+            string workDir,
+            string statusFile,
+            string clipLabel,
+            CancellationToken cancellationToken)
         {
+            var startStr = startSeconds.ToString("F2", CultureInfo.InvariantCulture);
+
             var vf = $"scale={TargetWidth}:{TargetHeight}:flags=lanczos:force_original_aspect_ratio=decrease,pad={TargetWidth}:{TargetHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={TargetFps},setpts=PTS-STARTPTS";
             var af = $"aresample={AudioRate}:async=1:first_pts=0,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS";
 
@@ -278,21 +543,57 @@ namespace Api.Controllers
                 $"-maxrate {VideoMaxrate} -bufsize {VideoBufsize} -g {GopSize} -keyint_min {GopSize} -flags +cgop -sc_threshold 0 -pix_fmt yuv420p " +
                 $"-c:a aac -b:a {AudioBitrate} -ar {AudioRate} -ac {AudioChannels} -movflags +faststart -y \"{clipPath}\"";
 
-            // Try 1: Cut 3s clip starting at 3s with video + audio
-            var args1 = $"-ss 3 -t {ClipDurationSeconds} -i \"{sourcePath}\" -vf \"{vf}\" -af \"{af}\" {commonEncFlags}";
+            // Try 1: Cut clip starting at random startSeconds with video + audio
+            var args1 = $"-ss {startStr} -t {clipDurationSeconds} -i \"{sourcePath}\" -vf \"{vf}\" -af \"{af}\" {commonEncFlags}";
             var rc = await RunProcessAsync("ffmpeg", args1, workDir, cancellationToken);
-            AppendStatus(statusFile, $"[ffmpeg-clip-{clipIndex}-try1] ExitCode={rc.ExitCode}");
+            AppendStatus(statusFile, $"[ffmpeg-clip-{clipLabel}-try1] ExitCode={rc.ExitCode}");
 
             if (rc.ExitCode == 0 && System.IO.File.Exists(clipPath) && new FileInfo(clipPath).Length > 1000)
                 return true;
 
-            // Try 2: Video-only + generated silent audio fallback (for videos lacking audio tracks)
-            var args2 = $"-ss 3 -t {ClipDurationSeconds} -i \"{sourcePath}\" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate={AudioRate} " +
+            // Try 2: Video-only + generated silent audio fallback
+            var args2 = $"-ss {startStr} -t {clipDurationSeconds} -i \"{sourcePath}\" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate={AudioRate} " +
                         $"-filter_complex \"[0:v]{vf}[v];[1:a]{af}[a]\" -map \"[v]\" -map \"[a]\" -shortest {commonEncFlags}";
             rc = await RunProcessAsync("ffmpeg", args2, workDir, cancellationToken);
-            AppendStatus(statusFile, $"[ffmpeg-clip-{clipIndex}-silent-fallback] ExitCode={rc.ExitCode}");
+            AppendStatus(statusFile, $"[ffmpeg-clip-{clipLabel}-silent-fallback] ExitCode={rc.ExitCode}");
 
             return rc.ExitCode == 0 && System.IO.File.Exists(clipPath) && new FileInfo(clipPath).Length > 1000;
+        }
+
+        private async Task<double> GetVideoDurationAsync(string videoPath, string workDir, CancellationToken cancellationToken)
+        {
+            try
+            {
+                var ffprobePath = FindExecutablePath("ffprobe");
+                if (!string.IsNullOrEmpty(ffprobePath))
+                {
+                    var args = $"-v error -show_entries format=duration -of default=noprintwrappers=1:nokey=1 \"{videoPath}\"";
+                    var res = await RunProcessAsync(ffprobePath, args, workDir, cancellationToken);
+                    if (res.ExitCode == 0 && double.TryParse(res.StdOut.Trim(), NumberStyles.Any, CultureInfo.InvariantCulture, out var duration) && duration > 0)
+                    {
+                        return duration;
+                    }
+                }
+            }
+            catch { }
+
+            try
+            {
+                var ffmpegPath = FindExecutablePath("ffmpeg") ?? "ffmpeg";
+                var res = await RunProcessAsync(ffmpegPath, $"-i \"{videoPath}\"", workDir, cancellationToken);
+                var combined = res.StdOut + Environment.NewLine + res.StdErr;
+                var match = System.Text.RegularExpressions.Regex.Match(combined, @"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)");
+                if (match.Success)
+                {
+                    var hours = double.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture);
+                    var minutes = double.Parse(match.Groups[2].Value, CultureInfo.InvariantCulture);
+                    var seconds = double.Parse(match.Groups[3].Value, CultureInfo.InvariantCulture);
+                    return hours * 3600 + minutes * 60 + seconds;
+                }
+            }
+            catch { }
+
+            return 30.0;
         }
 
         private async Task<bool> ConcatClipsAsync(List<string> clipFiles, string finalPath, string workDir, string statusFile, CancellationToken cancellationToken)
@@ -478,6 +779,70 @@ namespace Api.Controllers
             catch { }
         }
 
+        private async Task<string> ResolveChannelIdFromUrlAsync(string url, string apiKey)
+        {
+            if (string.IsNullOrWhiteSpace(url)) return null;
+
+            if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+            {
+                if (Uri.TryCreate("https://" + url, UriKind.Absolute, out uri) == false)
+                {
+                    return null;
+                }
+            }
+
+            string channelId = null;
+            var segments = uri.AbsolutePath.Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+            if (segments.Length >= 2 && segments[0].Equals("channel", StringComparison.OrdinalIgnoreCase))
+            {
+                channelId = segments[1];
+            }
+
+            if (string.IsNullOrEmpty(channelId) && segments.Length >= 2 && segments[0].Equals("user", StringComparison.OrdinalIgnoreCase))
+            {
+                var username = segments[1];
+                channelId = await ResolveChannelIdByUsernameAsync(username, apiKey);
+            }
+
+            if (string.IsNullOrEmpty(channelId) && segments.Length >= 1)
+            {
+                var first = segments[0];
+                if (first.StartsWith("@"))
+                {
+                    var handle = first.TrimStart('@');
+                    channelId = await ResolveChannelIdByQueryAsync(handle, apiKey);
+                }
+                else if (first.Equals("c", StringComparison.OrdinalIgnoreCase) && segments.Length >= 2)
+                {
+                    var custom = segments[1];
+                    channelId = await ResolveChannelIdByQueryAsync(custom, apiKey);
+                }
+            }
+
+            if (string.IsNullOrEmpty(channelId))
+            {
+                string videoId = null;
+                if (uri.Host.Contains("youtube.com", StringComparison.OrdinalIgnoreCase) && uri.AbsolutePath.StartsWith("/watch", StringComparison.OrdinalIgnoreCase))
+                {
+                    var q = System.Web.HttpUtility.ParseQueryString(uri.Query);
+                    videoId = q["v"];
+                }
+                else if (uri.Host.Equals("youtu.be", StringComparison.OrdinalIgnoreCase))
+                {
+                    var segs = uri.AbsolutePath.Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+                    if (segs.Length >= 1)
+                        videoId = segs[0];
+                }
+
+                if (!string.IsNullOrEmpty(videoId))
+                {
+                    channelId = await ResolveChannelIdByVideoIdAsync(videoId, apiKey);
+                }
+            }
+
+            return channelId;
+        }
+
         private async Task<string> ResolveChannelIdByUsernameAsync(string username, string apiKey)
         {
             var uri = $"https://www.googleapis.com/youtube/v3/channels?part=id&forUsername={Uri.EscapeDataString(username)}&key={apiKey}";
@@ -514,9 +879,31 @@ namespace Api.Controllers
             return null;
         }
 
-        private async Task<string[]> GetRandomVideoUrlsForChannelAsync(string channelId, int count, string apiKey)
+        private static string GetRandomPackageFileName(string extension = ".mp4")
         {
-            var uri = $"https://www.googleapis.com/youtube/v3/search?part=snippet&channelId={Uri.EscapeDataString(channelId)}&maxResults=50&type=video&key={apiKey}";
+            const string chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+            var rnd = Random.Shared;
+            var randomCode = new string(Enumerable.Repeat(chars, 10).Select(s => s[rnd.Next(s.Length)]).ToArray());
+            return $"trailer_{randomCode}{extension}";
+        }
+
+        private async Task<string[]> GetRandomVideoUrlsForChannelAsync(string channelId, int count, string apiKey, string minDate = null)
+        {
+            var cutoffDate = new DateTime(DateTime.UtcNow.Year, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            if (!string.IsNullOrWhiteSpace(minDate))
+            {
+                if (DateTime.TryParse(minDate, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal, out var parsedDate))
+                {
+                    cutoffDate = parsedDate;
+                }
+                else if (int.TryParse(minDate, out var y) && y > 1900)
+                {
+                    cutoffDate = new DateTime(y, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+                }
+            }
+
+            var publishedAfter = Uri.EscapeDataString(cutoffDate.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture));
+            var uri = $"https://www.googleapis.com/youtube/v3/search?part=snippet&channelId={Uri.EscapeDataString(channelId)}&publishedAfter={publishedAfter}&order=date&maxResults=50&type=video&key={apiKey}";
             var resp = await _httpClient.GetAsync(uri);
             resp.EnsureSuccessStatusCode();
             using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
@@ -526,6 +913,15 @@ namespace Api.Controllers
             {
                 try
                 {
+                    if (item.TryGetProperty("snippet", out var snippet) && snippet.TryGetProperty("publishedAt", out var pubProp))
+                    {
+                        if (DateTime.TryParse(pubProp.GetString(), CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal, out var pubDate))
+                        {
+                            if (pubDate < cutoffDate)
+                                continue;
+                        }
+                    }
+
                     var vid = item.GetProperty("id").GetProperty("videoId").GetString();
                     if (!string.IsNullOrEmpty(vid))
                         list.Add($"https://www.youtube.com/watch?v={vid}");
