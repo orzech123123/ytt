@@ -20,6 +20,23 @@ namespace Api.Controllers
         private static readonly HttpClient _httpClient = new HttpClient();
         private readonly IConfiguration _configuration;
 
+        // Android Chrome High-Definition Mobile Spec:
+        // 1080p 30fps CFR, H.264 Main Profile L4.1, CRF 18 (visually lossless), GOP 60 (2s keyframes), AAC 192k 48kHz, +faststart
+        private const int TargetWidth = 1920;
+        private const int TargetHeight = 1080;
+        private const int TargetFps = 30;
+        private const int GopSize = 60; // Exact keyframe every 2.0s at 30fps
+        private const string VideoProfile = "main";
+        private const string VideoLevel = "4.1";
+        private const string AudioRate = "48000";
+        private const string AudioChannels = "2";
+        private const string AudioBitrate = "192k";
+        private const string VideoMaxrate = "6000k";
+        private const string VideoBufsize = "12000k";
+
+        // 15 seconds total trailer: 5 clips x 3 seconds each
+        private const int ClipDurationSeconds = 3;
+
         public YoutubeController(IConfiguration configuration)
         {
             _configuration = configuration;
@@ -41,7 +58,6 @@ namespace Api.Controllers
 
             if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
             {
-                // Try to tolerate addresses without scheme
                 if (Uri.TryCreate("https://" + url, UriKind.Absolute, out uri) == false)
                 {
                     return BadRequest("Invalid URL format.");
@@ -50,21 +66,18 @@ namespace Api.Controllers
 
             string channelId = null;
 
-            // 1) If URL is a channel URL: /channel/{id}
             var segments = uri.AbsolutePath.Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries);
             if (segments.Length >= 2 && segments[0].Equals("channel", StringComparison.OrdinalIgnoreCase))
             {
                 channelId = segments[1];
             }
 
-            // 2) If URL is a user URL: /user/{username} -> resolve with channels.list?forUsername=
             if (string.IsNullOrEmpty(channelId) && segments.Length >= 2 && segments[0].Equals("user", StringComparison.OrdinalIgnoreCase))
             {
                 var username = segments[1];
                 channelId = await ResolveChannelIdByUsernameAsync(username, apiKey);
             }
 
-            // 3) If URL is a handle or custom: /@handle or /c/{name} -> try search by the last segment
             if (string.IsNullOrEmpty(channelId) && segments.Length >= 1)
             {
                 var first = segments[0];
@@ -80,11 +93,10 @@ namespace Api.Controllers
                 }
             }
 
-            // 4) If URL is a video URL (watch?v= or youtu.be/{id}) -> get video details to find channelId
             if (string.IsNullOrEmpty(channelId))
             {
                 string videoId = null;
-                if ((uri.Host.Contains("youtube.com", StringComparison.OrdinalIgnoreCase) && uri.AbsolutePath.StartsWith("/watch", StringComparison.OrdinalIgnoreCase)))
+                if (uri.Host.Contains("youtube.com", StringComparison.OrdinalIgnoreCase) && uri.AbsolutePath.StartsWith("/watch", StringComparison.OrdinalIgnoreCase))
                 {
                     var q = System.Web.HttpUtility.ParseQueryString(uri.Query);
                     videoId = q["v"];
@@ -107,11 +119,10 @@ namespace Api.Controllers
                 return BadRequest("Could not resolve a channel ID from the provided URL.");
             }
 
-            // Return 3 random videos from the channel (not the 3 most recent)
             try
             {
-                var videos = await GetRandomVideoUrlsForChannelAsync(channelId, 3, apiKey);
-
+                // Returns 5 random videos to make a 15s trailer (5 clips x 3s)
+                var videos = await GetRandomVideoUrlsForChannelAsync(channelId, 5, apiKey);
                 return Ok(new { videos });
             }
             catch (HttpRequestException ex)
@@ -124,160 +135,81 @@ namespace Api.Controllers
             }
         }
 
-        // NEW: Create trailer from provided list of video URLs.
-        // This implementation calls external tools: `yt-dlp` to download and `ffmpeg` to cut + concat.
-        // Requirements: yt-dlp and ffmpeg must be installed and available in PATH on the server.
-        // Behaviour: prefer best video up to 1080p and output MP4 clips/trailer.
-        // Added parameter cleanFiles (default false) to control whether temporary files are removed.
-        // Added optional query parameter `id` to let caller supply directory name (GUID like string).
         [HttpPost("trailer")]
         public async Task<IActionResult> CreateTrailer([FromBody] string[] urls, [FromQuery] bool cleanFiles = false, [FromQuery] string id = null, CancellationToken cancellationToken = default)
         {
             if (urls == null || urls.Length == 0)
                 return BadRequest("Provide an array of video URLs.");
 
-            // Limit to a reasonable number to avoid long processing
-            var maxVideos = 20;
+            // Take up to 5 videos for a 15-second trailer (5 clips x 3s each)
+            var maxVideos = 5;
             var list = urls.Take(maxVideos).ToArray();
 
-            // sanitize/ensure id - use provided or generate new
             if (string.IsNullOrWhiteSpace(id))
                 id = Guid.NewGuid().ToString("N");
             else
-                id = new string(id.Where(char.IsLetterOrDigit).ToArray()); // basic sanitation
+                id = new string(id.Where(char.IsLetterOrDigit).ToArray());
 
             var tempRoot = Path.Combine(Path.GetTempPath(), "ytt_trailer", id);
             Directory.CreateDirectory(tempRoot);
 
             var statusFile = Path.Combine(tempRoot, "status.txt");
-
-            var downloadedFiles = new List<string>();
             var clipFiles = new List<string>();
+
             try
             {
-                AppendStatus(statusFile, $"[INFO] Starting trailer creation for id={id} at {DateTime.UtcNow:O}");
+                AppendStatus(statusFile, $"[INFO] Starting 15s mobile trailer creation for id={id} ({list.Length} videos requested) at {DateTime.UtcNow:O}");
 
-                // 1) Download each video using yt-dlp (needs to be installed on server)
+                // 1) Fast download and cut 3s clip from each video
                 for (var i = 0; i < list.Length; i++)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     var url = list[i];
                     var prefix = Path.Combine(tempRoot, $"downloaded{i}");
+
                     var downloaded = await DownloadWithYtDlpAsync(url, prefix, cancellationToken);
-                    if (downloaded != null)
+                    if (downloaded == null || !System.IO.File.Exists(downloaded))
                     {
-                        downloadedFiles.Add(downloaded);
+                        AppendStatus(statusFile, $"[WARN] Skipping video {i} ({url}) - download failed.");
+                        continue;
+                    }
 
-                        // 2) Cut a short segment: from 3s to 7s (duration 4s). Output high-quality MP4 clips using libx264 (CRF 18) + AAC 192k.
-                        var clipPath = Path.Combine(tempRoot, $"clip{i}.mp4");
-                        var ffmpegArgs = $"-ss 3 -t 4 -i \"{downloaded}\" -c:v libx264 -preset fast -crf 18 -c:a aac -b:a 192k -pix_fmt yuv420p -y \"{clipPath}\"";
-                        var rc = await RunProcessAsync("ffmpeg", ffmpegArgs, tempRoot, cancellationToken);
+                    var clipPath = Path.Combine(tempRoot, $"clip{i}.mp4");
+                    var clipOk = await EncodeSingleClipAsync(downloaded, clipPath, tempRoot, statusFile, i, cancellationToken);
 
-                        // Persist process output into central status file
-                        AppendStatus(statusFile, $"[ffmpeg-clip-{i}] ExitCode={rc.ExitCode}\nStdOut:\n{rc.StdOut}\nStdErr:\n{rc.StdErr}");
-
-                        if (rc.ExitCode != 0)
-                        {
-                            // try fallback without -ss before input (safer for some formats)
-                            ffmpegArgs = $"-i \"{downloaded}\" -ss 3 -t 4 -c:v libx264 -preset fast -crf 18 -c:a aac -b:a 192k -pix_fmt yuv420p -y \"{clipPath}\"";
-                            rc = await RunProcessAsync("ffmpeg", ffmpegArgs, tempRoot, cancellationToken);
-                            AppendStatus(statusFile, $"[ffmpeg-clip-{i}-fallback] ExitCode={rc.ExitCode}\nStdOut:\n{rc.StdOut}\nStdErr:\n{rc.StdErr}");
-                        }
-
-                        if (rc.ExitCode != 0)
-                        {
-                            // fallback with generated silent audio in case the downloaded video is audio-less
-                            ffmpegArgs = $"-ss 3 -t 4 -i \"{downloaded}\" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 -c:v libx264 -preset fast -crf 18 -c:a aac -b:a 192k -map 0:v:0 -map 1:a:0 -shortest -pix_fmt yuv420p -y \"{clipPath}\"";
-                            rc = await RunProcessAsync("ffmpeg", ffmpegArgs, tempRoot, cancellationToken);
-                            AppendStatus(statusFile, $"[ffmpeg-clip-{i}-silent-audio-fallback] ExitCode={rc.ExitCode}\nStdOut:\n{rc.StdOut}\nStdErr:\n{rc.StdErr}");
-                        }
-
-                        // Write ffmpeg stdout/stderr to per-clip log files for debugging
-                        try
-                        {
-                            var stamp = DateTime.UtcNow.ToString("yyyyMMddHHmmss");
-                            var outLog = Path.Combine(tempRoot, $"ffmpeg_clip{i}_{stamp}_out.log");
-                            var errLog = Path.Combine(tempRoot, $"ffmpeg_clip{i}_{stamp}_err.log");
-                            System.IO.File.WriteAllText(outLog, rc.StdOut ?? string.Empty);
-                            System.IO.File.WriteAllText(errLog, rc.StdErr ?? string.Empty);
-                        }
-                        catch { /* best-effort logging */ }
-
-                        if (rc.ExitCode == 0 && System.IO.File.Exists(clipPath))
-                        {
-                            clipFiles.Add(clipPath);
-                        }
+                    if (clipOk && System.IO.File.Exists(clipPath))
+                    {
+                        clipFiles.Add(clipPath);
+                    }
+                    else
+                    {
+                        AppendStatus(statusFile, $"[WARN] Skipping clip {i} - encoding failed.");
                     }
                 }
 
                 if (clipFiles.Count == 0)
                 {
-                    AppendStatus(statusFile, "[ERROR] Failed to create any clips.");
-                    return StatusCode(500, "Failed to create any clips.");
+                    AppendStatus(statusFile, "[ERROR] Failed to create any valid clips.");
+                    return StatusCode(500, "Failed to create any valid clips.");
                 }
 
-                // 3) CONCAT: Reliable approach — re-encode all inputs to high-quality 1080p format then concat via filter_complex.
+                AppendStatus(statusFile, $"[INFO] Prepared {clipFiles.Count} / {list.Length} clips ({clipFiles.Count * ClipDurationSeconds}s total duration).");
+
                 var finalPath = Path.Combine(tempRoot, "trailer.mp4");
-                try
+
+                // 2) Fast filter_complex concatenation
+                var concatOk = await ConcatClipsAsync(clipFiles, finalPath, tempRoot, statusFile, cancellationToken);
+
+                if (!concatOk || !System.IO.File.Exists(finalPath))
                 {
-                    var inputsSb = new StringBuilder();
-                    for (var i = 0; i < clipFiles.Count; i++)
-                    {
-                        inputsSb.Append($"-i \"{clipFiles[i]}\" ");
-                    }
-
-                    // Build filter_complex that scales all inputs to 1920x1080 using Lanczos resampling before concatenating
-                    var filterSb = new StringBuilder();
-                    for (var i = 0; i < clipFiles.Count; i++)
-                    {
-                        // Scale video to 1920x1080 with high-quality Lanczos filter, pad if needed to maintain aspect ratio
-                        filterSb.Append($"[{i}:v]scale=1920:1080:flags=lanczos:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}];");
-                        // Normalize audio
-                        filterSb.Append($"[{i}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a{i}];");
-                    }
-
-                    // Now concat the normalized streams
-                    for (var i = 0; i < clipFiles.Count; i++)
-                    {
-                        filterSb.Append($"[v{i}][a{i}]");
-                    }
-                    filterSb.Append($"concat=n={clipFiles.Count}:v=1:a=1[outv][outa]");
-
-                    var concatArgs = $"{inputsSb.ToString()}-filter_complex \"{filterSb}\" -map \"[outv]\" -map \"[outa]\" -r 30 -pix_fmt yuv420p -c:v libx264 -preset fast -crf 18 -profile:v high -level 4.1 -c:a aac -b:a 256k -ar 48000 -y \"{finalPath}\"";
-
-                    var concatRc = await RunProcessAsync("ffmpeg", concatArgs, tempRoot, cancellationToken);
-
-                    AppendStatus(statusFile, $"[ffmpeg-normalize-concat] ExitCode={concatRc.ExitCode}\nStdOut:\n{concatRc.StdOut}\nStdErr:\n{concatRc.StdErr}");
-
-                    // Write concat ffmpeg logs
-                    try
-                    {
-                        var stamp = DateTime.UtcNow.ToString("yyyyMMddHHmmss");
-                        var outLog = Path.Combine(tempRoot, $"ffmpeg_concat_{stamp}_out.log");
-                        var errLog = Path.Combine(tempRoot, $"ffmpeg_concat_{stamp}_err.log");
-                        System.IO.File.WriteAllText(outLog, concatRc.StdOut ?? string.Empty);
-                        System.IO.File.WriteAllText(errLog, concatRc.StdErr ?? string.Empty);
-                    }
-                    catch { /*best-effort*/ }
-
-                    if (concatRc.ExitCode != 0 || !System.IO.File.Exists(finalPath))
-                    {
-                        AppendStatus(statusFile, "[ERROR] Failed to concatenate clips into trailer (normalize strategy).");
-                        return StatusCode(500, "Failed to concatenate clips into trailer.");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    AppendStatus(statusFile, $"[ERROR] Exception while running normalize concat: {ex}");
-                    return StatusCode(500, $"Failed to concatenate clips into trailer: {ex.Message}");
+                    AppendStatus(statusFile, "[ERROR] Failed to concatenate clips into final trailer.");
+                    return StatusCode(500, "Failed to concatenate clips into trailer.");
                 }
 
-                AppendStatus(statusFile, $"[INFO] Trailer created successfully at {DateTime.UtcNow:O}");
+                AppendStatus(statusFile, $"[INFO] 15s Trailer created successfully ({clipFiles.Count} clips included) at {DateTime.UtcNow:O}");
 
-                // 5) Stream the file back
                 var fs = System.IO.File.OpenRead(finalPath);
-                // Return FileStreamResult; letting ASP.NET Core handle range requests may be beneficial for large files
-                return File(fs, "video/mp4", "trailer.mp4");
+                return File(fs, "video/mp4", "trailer.mp4", enableRangeProcessing: true);
             }
             catch (OperationCanceledException)
             {
@@ -291,7 +223,6 @@ namespace Api.Controllers
             }
             finally
             {
-                // cleanup only when requested. Default is false so files are preserved for debugging.
                 if (cleanFiles)
                 {
                     _ = Task.Run(() =>
@@ -301,20 +232,19 @@ namespace Api.Controllers
                             if (Directory.Exists(tempRoot))
                                 Directory.Delete(tempRoot, true);
                         }
-                        catch { /* ignore cleanup errors */ }
+                        catch { }
                     });
                 }
             }
         }
 
-        // New endpoint: read aggregated logs/status for a given id (GUID folder name)
         [HttpGet("logs/{id}")]
         public IActionResult GetLogs(string id)
         {
             if (string.IsNullOrWhiteSpace(id))
                 return BadRequest("Missing id.");
 
-            id = new string(id.Where(char.IsLetterOrDigit).ToArray()); // basic sanitation
+            id = new string(id.Where(char.IsLetterOrDigit).ToArray());
             var dir = Path.Combine(Path.GetTempPath(), "ytt_trailer", id);
             if (!Directory.Exists(dir))
                 return NotFound();
@@ -326,7 +256,6 @@ namespace Api.Controllers
                 return Content(text, "text/plain");
             }
 
-            // Fallback: concatenate any log files present
             var logs = Directory.GetFiles(dir, "*.log").OrderBy(f => f).Select(f =>
             {
                 try { return System.IO.File.ReadAllText(f); } catch { return string.Empty; }
@@ -335,22 +264,86 @@ namespace Api.Controllers
             return Content(combined, "text/plain");
         }
 
+        // ---------------------------------------------------------------
+        // High-Quality Clip Encoding (3s per clip, H.264 Main L4.1 1080p CFR 30fps)
+        // ---------------------------------------------------------------
+
+        private async Task<bool> EncodeSingleClipAsync(string sourcePath, string clipPath, string workDir, string statusFile, int clipIndex, CancellationToken cancellationToken)
+        {
+            var vf = $"scale={TargetWidth}:{TargetHeight}:flags=lanczos:force_original_aspect_ratio=decrease,pad={TargetWidth}:{TargetHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={TargetFps},setpts=PTS-STARTPTS";
+            var af = $"aresample={AudioRate}:async=1:first_pts=0,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS";
+
+            var commonEncFlags =
+                $"-fps_mode cfr -r {TargetFps} -c:v libx264 -profile:v {VideoProfile} -level {VideoLevel} -preset medium -crf 18 " +
+                $"-maxrate {VideoMaxrate} -bufsize {VideoBufsize} -g {GopSize} -keyint_min {GopSize} -flags +cgop -sc_threshold 0 -pix_fmt yuv420p " +
+                $"-c:a aac -b:a {AudioBitrate} -ar {AudioRate} -ac {AudioChannels} -movflags +faststart -y \"{clipPath}\"";
+
+            // Try 1: Cut 3s clip starting at 3s with video + audio
+            var args1 = $"-ss 3 -t {ClipDurationSeconds} -i \"{sourcePath}\" -vf \"{vf}\" -af \"{af}\" {commonEncFlags}";
+            var rc = await RunProcessAsync("ffmpeg", args1, workDir, cancellationToken);
+            AppendStatus(statusFile, $"[ffmpeg-clip-{clipIndex}-try1] ExitCode={rc.ExitCode}");
+
+            if (rc.ExitCode == 0 && System.IO.File.Exists(clipPath) && new FileInfo(clipPath).Length > 1000)
+                return true;
+
+            // Try 2: Video-only + generated silent audio fallback (for videos lacking audio tracks)
+            var args2 = $"-ss 3 -t {ClipDurationSeconds} -i \"{sourcePath}\" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate={AudioRate} " +
+                        $"-filter_complex \"[0:v]{vf}[v];[1:a]{af}[a]\" -map \"[v]\" -map \"[a]\" -shortest {commonEncFlags}";
+            rc = await RunProcessAsync("ffmpeg", args2, workDir, cancellationToken);
+            AppendStatus(statusFile, $"[ffmpeg-clip-{clipIndex}-silent-fallback] ExitCode={rc.ExitCode}");
+
+            return rc.ExitCode == 0 && System.IO.File.Exists(clipPath) && new FileInfo(clipPath).Length > 1000;
+        }
+
+        private async Task<bool> ConcatClipsAsync(List<string> clipFiles, string finalPath, string workDir, string statusFile, CancellationToken cancellationToken)
+        {
+            var inputsSb = new StringBuilder();
+            for (var i = 0; i < clipFiles.Count; i++)
+            {
+                inputsSb.Append($"-i \"{clipFiles[i]}\" ");
+            }
+
+            var filterSb = new StringBuilder();
+            for (var i = 0; i < clipFiles.Count; i++)
+            {
+                filterSb.Append($"[{i}:v][{i}:a]");
+            }
+            filterSb.Append($"concat=n={clipFiles.Count}:v=1:a=1[vraw][araw];");
+            filterSb.Append($"[vraw]fps={TargetFps},format=yuv420p,setpts=PTS-STARTPTS[outv];");
+            filterSb.Append($"[araw]aresample={AudioRate}:async=1,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS[outa]");
+
+            var args =
+                $"{inputsSb}-filter_complex \"{filterSb}\" -map \"[outv]\" -map \"[outa]\" " +
+                $"-fps_mode cfr -r {TargetFps} -pix_fmt yuv420p " +
+                $"-c:v libx264 -profile:v {VideoProfile} -level {VideoLevel} -preset medium -crf 18 " +
+                $"-maxrate {VideoMaxrate} -bufsize {VideoBufsize} -g {GopSize} -keyint_min {GopSize} -flags +cgop -sc_threshold 0 " +
+                $"-c:a aac -b:a {AudioBitrate} -ar {AudioRate} -ac {AudioChannels} -movflags +faststart -y \"{finalPath}\"";
+
+            var rc = await RunProcessAsync("ffmpeg", args, workDir, cancellationToken);
+            AppendStatus(statusFile, $"[ffmpeg-concat] ExitCode={rc.ExitCode}");
+
+            return rc.ExitCode == 0 && System.IO.File.Exists(finalPath);
+        }
+
+        // ---------------------------------------------------------------
+        // Robust Download Helper (with multi-client fallback for HTTP 403 prevention)
+        // ---------------------------------------------------------------
+
         private async Task<string> DownloadWithYtDlpAsync(string url, string destPrefix, CancellationToken cancellationToken)
         {
-            // Prioritize high-definition 1080p split streams, falling back to best combined or available formats.
             var outputTemplate = destPrefix + ".%(ext)s";
-            var format = "bestvideo[height<=1080]+bestaudio/bestvideo+bestaudio/best[height<=1080]/best";
-            var args = $"-f \"{format}\" --merge-output-format mp4 -o \"{outputTemplate}\" \"{url}\"";
+            var extractorArgs = "--extractor-args \"youtube:player_client=android,web,mweb\"";
+
+            // Tier 1: Download 1080p split streams or best combined format
+            var format1 = "bestvideo[height<=1080]+bestaudio/bestvideo+bestaudio/b[height<=1080]/18/22/best";
+            var args1 = $"{extractorArgs} -f \"{format1}\" --merge-output-format mp4 --no-playlist -o \"{outputTemplate}\" \"{url}\"";
 
             var workDir = Path.GetDirectoryName(destPrefix);
-
-            // Try to locate yt-dlp executable and, if present, detect a colocated deno executable.
             var ytDlpPath = FindExecutablePath("yt-dlp");
             var denoPath = default(string);
 
             try
             {
-                // If yt-dlp was found, check its directory for deno
                 if (!string.IsNullOrEmpty(ytDlpPath))
                 {
                     var ytDir = Path.GetDirectoryName(ytDlpPath);
@@ -365,55 +358,42 @@ namespace Api.Controllers
                     }
                 }
 
-                // If no colocated deno, fall back to resolving deno from PATH
                 if (string.IsNullOrEmpty(denoPath))
                 {
                     denoPath = FindExecutablePath("deno");
                 }
 
-                // If deno was found, add the --js-runtimes option so yt-dlp uses that deno executable.
-                // Use explicit yt-dlp full path if available to ensure we're invoking the same binary.
                 if (!string.IsNullOrEmpty(denoPath))
                 {
-                    // Prepend runtime mapping; yt-dlp expects format like: --js-runtimes deno:PATH
-                    // Ensure the path is quoted.
-                    args = $"--js-runtimes deno:\"{denoPath}\" {args}";
-                    try
-                    {
-                        var statusFile = Path.Combine(workDir ?? Path.GetTempPath(), "status.txt");
-                        AppendStatus(statusFile, $"[INFO] Detected deno at '{denoPath}', injecting --js-runtimes.");
-                    }
-                    catch { /* best-effort logging */ }
+                    args1 = $"--js-runtimes deno:\"{denoPath}\" {args1}";
                 }
             }
-            catch
-            {
-                // non-fatal - proceed without runtime injection
-            }
+            catch { }
 
             var fileNameToRun = !string.IsNullOrEmpty(ytDlpPath) ? ytDlpPath : "yt-dlp";
-            var res = await RunProcessAsync(fileNameToRun, args, workDir, cancellationToken);
+            var res = await RunProcessAsync(fileNameToRun, args1, workDir, cancellationToken);
+
+            // Tier 2: Universal fallback format if primary format fails
             if (res.ExitCode != 0)
             {
-                // Try fallback format if primary format failed
                 var jsOpt = !string.IsNullOrEmpty(denoPath) ? $"--js-runtimes deno:\"{denoPath}\" " : "";
-                var fallbackArgs = $"{jsOpt}-f \"best[height<=1080]/b/best\" -o \"{outputTemplate}\" \"{url}\"";
+                var fallbackArgs = $"{jsOpt}{extractorArgs} -f \"best\" --no-playlist -o \"{outputTemplate}\" \"{url}\"";
                 res = await RunProcessAsync(fileNameToRun, fallbackArgs, workDir, cancellationToken);
             }
 
-            try
+            // Tier 3: Absolute fallback
+            if (res.ExitCode != 0)
             {
-                var statusFile = Path.Combine(workDir ?? Path.GetTempPath(), "status.txt");
-                AppendStatus(statusFile, $"[yt-dlp] ExitCode={res.ExitCode}\nStdOut:\n{res.StdOut}\nStdErr:\n{res.StdErr}");
+                var jsOpt = !string.IsNullOrEmpty(denoPath) ? $"--js-runtimes deno:\"{denoPath}\" " : "";
+                var fallbackArgs2 = $"{jsOpt}-f \"worstvideo+worstaudio/worst\" --no-playlist -o \"{outputTemplate}\" \"{url}\"";
+                res = await RunProcessAsync(fileNameToRun, fallbackArgs2, workDir, cancellationToken);
             }
-            catch { }
 
             if (res.ExitCode != 0)
             {
                 return null;
             }
 
-            // find created file(s), ignoring incomplete .part or .ytdl files
             var dir = workDir ?? Environment.CurrentDirectory;
             var prefix = Path.GetFileName(destPrefix) + ".";
             var files = Directory.GetFiles(dir, prefix + "*")
@@ -424,38 +404,6 @@ namespace Api.Controllers
             if (files.Length == 0)
                 return null;
 
-            // If there are at least two files, try to merge the two largest into a single mp4 using the exact ffmpeg params requested.
-            if (files.Length >= 2)
-            {
-                var largest = files[0];   // expected to contain the video stream (largest)
-                var second = files[1];    // expected to contain audio or alternate stream
-
-                var mergedName = Path.GetFileNameWithoutExtension(destPrefix) + "_merged.mp4";
-                var mergedPath = Path.Combine(dir, mergedName);
-
-                // Use the exact ffmpeg invocation requested:
-                // ffmpeg -i "<largest>" -i "<second>" -c:v copy -c:a aac -map 0:v:0 -map 1:a:0 output.mp4
-                var ffmpegArgs = $"-i \"{largest}\" -i \"{second}\" -c:v copy -c:a aac -map 0:v:0 -map 1:a:0 -y \"{mergedPath}\"";
-
-                var concatRc = await RunProcessAsync("ffmpeg", ffmpegArgs, dir, cancellationToken);
-
-                try
-                {
-                    var statusFile = Path.Combine(dir, "status.txt");
-                    AppendStatus(statusFile, $"[ffmpeg-merge] ExitCode={concatRc.ExitCode}\nStdOut:\n{concatRc.StdOut}\nStdErr:\n{concatRc.StdErr}");
-                }
-                catch { /* best-effort logging */ }
-
-                if (concatRc.ExitCode == 0 && System.IO.File.Exists(mergedPath))
-                {
-                    return mergedPath;
-                }
-
-                // If merge failed, fall back to returning the largest file (so caller still gets something)
-                return largest;
-            }
-
-            // Single file case - return the only artifact
             return files[0];
         }
 
@@ -478,11 +426,7 @@ namespace Api.Controllers
             using var proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
             proc.Exited += (s, e) =>
             {
-                try
-                {
-                    tcs.TrySetResult(proc.ExitCode);
-                }
-                catch { }
+                try { tcs.TrySetResult(proc.ExitCode); } catch { }
             };
 
             try
@@ -494,20 +438,14 @@ namespace Api.Controllers
 
                 using (cancellationToken.Register(() =>
                 {
-                    try
-                    {
-                        if (!proc.HasExited) proc.Kill(true);
-                    }
-                    catch { }
+                    try { if (!proc.HasExited) proc.Kill(true); } catch { }
                 }))
                 {
-                    // Wait for process exit and output read completion
                     await Task.WhenAll(tcs.Task, stdoutTask, stderrTask);
                     var exitCode = tcs.Task.Status == TaskStatus.RanToCompletion ? tcs.Task.Result : proc.HasExited ? proc.ExitCode : -1;
                     var stdOut = stdoutTask.IsCompleted ? stdoutTask.Result : string.Empty;
                     var stdErr = stderrTask.IsCompleted ? stderrTask.Result : string.Empty;
 
-                    // persist logs to workingDirectory for debugging (best-effort)
                     try
                     {
                         var dir = workingDirectory ?? Environment.CurrentDirectory;
@@ -518,18 +456,14 @@ namespace Api.Controllers
                         System.IO.File.WriteAllText(outLog, stdOut);
                         System.IO.File.WriteAllText(errLog, stdErr);
                     }
-                    catch { /* ignore logging errors */ }
+                    catch { }
 
                     return new ProcessResult(exitCode, stdOut, stdErr);
                 }
             }
             catch
             {
-                try
-                {
-                    if (!proc.HasExited) proc.Kill(true);
-                }
-                catch { }
+                try { if (!proc.HasExited) proc.Kill(true); } catch { }
                 throw;
             }
         }
@@ -541,10 +475,7 @@ namespace Api.Controllers
                 var entry = $"[{DateTime.UtcNow:O}] {text}{Environment.NewLine}";
                 System.IO.File.AppendAllText(statusFilePath, entry);
             }
-            catch
-            {
-                // best-effort; ignore any IO errors to not fail main flow
-            }
+            catch { }
         }
 
         private async Task<string> ResolveChannelIdByUsernameAsync(string username, string apiKey)
@@ -555,25 +486,19 @@ namespace Api.Controllers
             using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
             var items = doc.RootElement.GetProperty("items");
             if (items.GetArrayLength() > 0)
-            {
                 return items[0].GetProperty("id").GetString();
-            }
             return null;
         }
 
         private async Task<string> ResolveChannelIdByQueryAsync(string query, string apiKey)
         {
-            // Search for channel by query (handles, custom names)
             var uri = $"https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&maxResults=1&q={Uri.EscapeDataString(query)}&key={apiKey}";
             var resp = await _httpClient.GetAsync(uri);
             resp.EnsureSuccessStatusCode();
             using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
             var items = doc.RootElement.GetProperty("items");
             if (items.GetArrayLength() > 0)
-            {
-                var channelId = items[0].GetProperty("snippet").GetProperty("channelId").GetString();
-                return channelId;
-            }
+                return items[0].GetProperty("snippet").GetProperty("channelId").GetString();
             return null;
         }
 
@@ -585,19 +510,12 @@ namespace Api.Controllers
             using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
             var items = doc.RootElement.GetProperty("items");
             if (items.GetArrayLength() > 0)
-            {
-                var channelId = items[0].GetProperty("snippet").GetProperty("channelId").GetString();
-                return channelId;
-            }
+                return items[0].GetProperty("snippet").GetProperty("channelId").GetString();
             return null;
         }
 
-        // Placeholder: existing helper used earlier (not shown in snippet). Keep existing implementation.
         private async Task<string[]> GetRandomVideoUrlsForChannelAsync(string channelId, int count, string apiKey)
         {
-            // Very small, focused implementation to keep compatibility with existing behavior.
-            // This method should return an array of video URLs for the channel.
-            // For brevity, using the search.list endpoint for recent uploads and picking random ones.
             var uri = $"https://www.googleapis.com/youtube/v3/search?part=snippet&channelId={Uri.EscapeDataString(channelId)}&maxResults=50&type=video&key={apiKey}";
             var resp = await _httpClient.GetAsync(uri);
             resp.EnsureSuccessStatusCode();
@@ -624,11 +542,8 @@ namespace Api.Controllers
             if (string.IsNullOrWhiteSpace(name))
                 return null;
 
-            // Normalize requested name for checks (allow "deno" or "deno.exe")
             var requested = name;
 
-            // On Windows, check common per-user deno install location first:
-            // %USERPROFILE%\.deno\bin\deno.exe (this matches the output from the installer you ran)
             if (Environment.OSVersion.Platform == PlatformID.Win32NT &&
                 (requested.Equals("deno", StringComparison.OrdinalIgnoreCase) || requested.Equals("deno.exe", StringComparison.OrdinalIgnoreCase)))
             {
@@ -642,10 +557,9 @@ namespace Api.Controllers
                             return candidate;
                     }
                 }
-                catch { /* best-effort */ }
+                catch { }
             }
 
-            // If an absolute path was provided and exists, return it
             if (Path.IsPathRooted(requested) && System.IO.File.Exists(requested))
                 return requested;
 
@@ -656,7 +570,6 @@ namespace Api.Controllers
                 ? (Environment.GetEnvironmentVariable("PATHEXT") ?? ".EXE;.CMD;.BAT;.COM").Split(';', StringSplitOptions.RemoveEmptyEntries)
                 : new[] { string.Empty };
 
-            // Search PATH directories with PATHEXT
             foreach (var dir in paths)
             {
                 if (string.IsNullOrWhiteSpace(dir))
@@ -665,43 +578,21 @@ namespace Api.Controllers
                 foreach (var ext in pathext)
                 {
                     var candidate = Path.Combine(dir, requested + ext);
-                    try
-                    {
-                        if (System.IO.File.Exists(candidate))
-                            return candidate;
-                    }
-                    catch { }
+                    try { if (System.IO.File.Exists(candidate)) return candidate; } catch { }
                 }
 
-                // Also check the name without extension (useful on Unix)
                 var candNoExt = Path.Combine(dir, requested);
-                try
-                {
-                    if (System.IO.File.Exists(candNoExt))
-                        return candNoExt;
-                }
-                catch { }
+                try { if (System.IO.File.Exists(candNoExt)) return candNoExt; } catch { }
             }
 
-            // Finally check current directory
             foreach (var ext in pathext)
             {
                 var cur = Path.Combine(Environment.CurrentDirectory, requested + ext);
-                try
-                {
-                    if (System.IO.File.Exists(cur))
-                        return cur;
-                }
-                catch { }
+                try { if (System.IO.File.Exists(cur)) return cur; } catch { }
             }
 
             var curNoExt = Path.Combine(Environment.CurrentDirectory, requested);
-            try
-            {
-                if (System.IO.File.Exists(curNoExt))
-                    return curNoExt;
-            }
-            catch { }
+            try { if (System.IO.File.Exists(curNoExt)) return curNoExt; } catch { }
 
             return null;
         }
